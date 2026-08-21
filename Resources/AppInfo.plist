@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Photo Duplicate Cleaner</string>
+    <key>CFBundleExecutable</key>
+    <string>PhotoDuplicateCleaner</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.anthonyflores.PhotoDuplicateCleaner</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>PhotoDuplicateCleaner</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.photography</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Photo Duplicate Cleaner compares media, preserves selected metadata, and moves only approved duplicate copies to Recently Deleted.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Local personal utility</string>
+</dict>
+</plist>
