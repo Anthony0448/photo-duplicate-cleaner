@@ -98,7 +98,7 @@ struct CoreTests {
         second.isFavorite = true
         let group = DuplicateGroup(id: UUID(), confidence: .likelyVisual, assets: [first, second], evidence: [])
 
-        let proposal = planner.proposal(for: group, keeperID: first.id)
+        let proposal = planner.proposal(for: group, keeperID: first.id, deleting: [second.id])
 
         #expect(proposal.conflicts.contains { $0.field == .creationDate })
         #expect(proposal.conflicts.contains { $0.field == .location })
@@ -137,7 +137,7 @@ struct CoreTests {
         second.location = .init(latitude: 34.00005, longitude: -118.00005)
         let group = DuplicateGroup(id: UUID(), confidence: .contentExact, assets: [first, second], evidence: [])
 
-        let proposal = planner.proposal(for: group, keeperID: first.id)
+        let proposal = planner.proposal(for: group, keeperID: first.id, deleting: [second.id])
 
         #expect(!proposal.conflicts.contains { $0.field == .creationDate })
         #expect(!proposal.conflicts.contains { $0.field == .location })
@@ -157,10 +157,59 @@ struct CoreTests {
         ))
         let group = DuplicateGroup(id: UUID(), confidence: .likelyVisual, assets: [first, second], evidence: [])
 
-        let proposal = planner.proposal(for: group, keeperID: first.id)
+        let proposal = planner.proposal(for: group, keeperID: first.id, deleting: [second.id])
 
         #expect(proposal.conflicts.contains { $0.field == .adjustments })
         #expect(proposal.conflicts.contains { $0.field == .resourceTopology })
+    }
+
+    @Test func selectingKeeperMarksAllOtherExactAndVisualCopiesForDeletion() {
+        let planner = FidelityMergePlanner()
+        let first = fixture(id: "one", resourceHash: "a")
+        let second = fixture(id: "two", resourceHash: "b")
+        let visual = DuplicateGroup(id: UUID(), confidence: .likelyVisual, assets: [first, second], evidence: [])
+        let exact = DuplicateGroup(id: UUID(), confidence: .contentExact, assets: [first, second], evidence: [])
+
+        let visualProposal = planner.proposal(for: visual, keeperID: first.id)
+        let exactProposal = planner.proposal(for: exact, keeperID: first.id)
+
+        #expect(visualProposal.selectedDonors.map(\.id) == [second.id])
+        #expect(visualProposal.canApprove)
+        #expect(exactProposal.selectedDonors.map(\.id) == [second.id])
+        #expect(exactProposal.canApprove)
+    }
+
+    @Test func explicitlyDeselectedDonorsRemainKept() {
+        let planner = FidelityMergePlanner()
+        let first = fixture(id: "one", resourceHash: "a")
+        let second = fixture(id: "two", resourceHash: "b")
+        let group = DuplicateGroup(id: UUID(), confidence: .likelyVisual, assets: [first, second], evidence: [])
+
+        let proposal = planner.proposal(for: group, keeperID: first.id, deleting: [])
+
+        #expect(proposal.selectedDonors.isEmpty)
+        #expect(proposal.retainedCandidates.map(\.id) == [second.id])
+        #expect(!proposal.canApprove)
+    }
+
+    @Test func retainedCandidatesDoNotContributeMetadataOrConflicts() {
+        let planner = FidelityMergePlanner()
+        var keeper = fixture(id: "keeper", resourceHash: "a")
+        keeper.creationDate = Date(timeIntervalSince1970: 1_000)
+        var deleted = fixture(id: "deleted", resourceHash: "b")
+        deleted.creationDate = Date(timeIntervalSince1970: 1_001)
+        deleted.keywords = ["merge-me"]
+        var retained = fixture(id: "retained", resourceHash: "c")
+        retained.creationDate = Date(timeIntervalSince1970: 99_000)
+        retained.keywords = ["do-not-merge"]
+        let group = DuplicateGroup(id: UUID(), confidence: .likelyVisual, assets: [keeper, deleted, retained], evidence: [])
+
+        let proposal = planner.proposal(for: group, keeperID: keeper.id, deleting: [deleted.id])
+
+        #expect(proposal.selectedDonors.map(\.id) == [deleted.id])
+        #expect(proposal.retainedCandidates.map(\.id) == [retained.id])
+        #expect(proposal.proposedKeywords == ["merge-me"])
+        #expect(!proposal.conflicts.contains { $0.field == .creationDate })
     }
 
     @Test func journalRoundTripAndExports() throws {
@@ -169,6 +218,7 @@ struct CoreTests {
         let asset = fixture(id: "one", resourceHash: "hash")
         let proposal = MergeProposal(
             id: UUID(), groupID: UUID(), confidence: .binaryExact, keeper: asset, donors: [fixture(id: "two", resourceHash: "hash")],
+            donorIDsToDelete: ["two"],
             proposedCreationDate: nil, proposedLocation: nil, proposedCaption: nil, proposedRating: nil,
             proposedFavorite: false, proposedHidden: false, proposedKeywords: [], albumsToAdd: [], conflicts: [], isApproved: true
         )
@@ -182,6 +232,39 @@ struct CoreTests {
         #expect(loaded.first?.status == .succeeded)
         #expect(FileManager.default.fileExists(atPath: json.path))
         #expect(FileManager.default.fileExists(atPath: csv.path))
+    }
+
+    @Test func reviewSessionRestoresScopeGroupsAndDecisionsAcrossLaunches() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
+        let keeper = fixture(id: "keeper", resourceHash: "same")
+        let donor = fixture(id: "donor", resourceHash: "same")
+        let proposal = MergeProposal(
+            id: UUID(), groupID: UUID(), confidence: .binaryExact, keeper: keeper, donors: [donor],
+            donorIDsToDelete: [donor.id],
+            proposedCreationDate: keeper.creationDate, proposedLocation: nil, proposedCaption: nil, proposedRating: nil,
+            proposedFavorite: false, proposedHidden: false, proposedKeywords: [], albumsToAdd: [], conflicts: [], isApproved: true
+        )
+        let scanDate = Date(timeIntervalSince1970: 123_456)
+        let session = SavedReviewSession(
+            savedAt: scanDate,
+            lastScanDate: scanDate,
+            scope: .init(kind: .selectedAlbums, albumIDs: ["album-1", "album-2"]),
+            proposals: [proposal]
+        )
+
+        try store.save(session)
+        let restored = try store.load()
+
+        #expect(restored?.lastScanDate == scanDate)
+        #expect(restored?.scope.kind == .selectedAlbums)
+        #expect(restored?.scope.albumIDs == ["album-1", "album-2"])
+        #expect(restored?.proposals.first?.keeper.id == keeper.id)
+        #expect(restored?.proposals.first?.donorIDsToDelete == [donor.id])
+        #expect(restored?.proposals.first?.isApproved == true)
+
+        try store.clear()
+        #expect(try store.load() == nil)
     }
 
     private func fixture(id: String, resourceHash: String?) -> AssetSnapshot {

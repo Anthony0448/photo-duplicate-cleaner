@@ -61,7 +61,7 @@ protocol DuplicateMatcher {
 }
 
 protocol MergePlanner {
-    func proposal(for group: DuplicateGroup, keeperID: String?) -> MergeProposal
+    func proposal(for group: DuplicateGroup, keeperID: String?, deleting donorIDs: Set<String>?) -> MergeProposal
 }
 
 protocol CleanupApplier {
@@ -78,5 +78,11 @@ protocol JournalStore {
 protocol InventoryCache {
     func load() throws -> [AssetSnapshot]
     func save(_ assets: [AssetSnapshot]) throws
+    func clear() throws
+}
+
+protocol ReviewSessionStore {
+    func load() throws -> SavedReviewSession?
+    func save(_ session: SavedReviewSession) throws
     func clear() throws
 }

@@ -1,11 +1,15 @@
 import Foundation
 
 final class FidelityMergePlanner: MergePlanner {
-    func proposal(for group: DuplicateGroup, keeperID: String? = nil) -> MergeProposal {
+    func proposal(for group: DuplicateGroup, keeperID: String? = nil, deleting donorIDs: Set<String>? = nil) -> MergeProposal {
         let keeper = keeperID.flatMap { requested in group.assets.first { $0.id == requested } }
             ?? group.assets.max(by: { fidelityScore($0) < fidelityScore($1) })!
         let donors = group.assets.filter { $0.id != keeper.id }
-        let all = [keeper] + donors
+        let defaultDeletionIDs = Set(donors.map(\.id))
+        let deletionIDs = (donorIDs ?? defaultDeletionIDs)
+            .intersection(Set(donors.map(\.id)))
+        let selectedDonors = donors.filter { deletionIDs.contains($0.id) }
+        let all = [keeper] + selectedDonors
         let conflicts = metadataConflicts(in: all)
 
         let dates = uniqueDates(all.compactMap(\.creationDate))
@@ -21,6 +25,7 @@ final class FidelityMergePlanner: MergePlanner {
             confidence: group.confidence,
             keeper: keeper,
             donors: donors,
+            donorIDsToDelete: deletionIDs,
             proposedCreationDate: dates.count == 1 ? dates[0] : keeper.creationDate,
             proposedLocation: locations.count == 1 ? locations[0] : keeper.location,
             proposedCaption: captions.count == 1 ? captions[0] : keeper.caption,

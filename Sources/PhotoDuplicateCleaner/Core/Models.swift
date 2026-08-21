@@ -173,6 +173,7 @@ struct MergeProposal: Codable, Identifiable, Equatable, Sendable {
     var confidence: MatchConfidence
     var keeper: AssetSnapshot
     var donors: [AssetSnapshot]
+    var donorIDsToDelete: Set<String>
     var proposedCreationDate: Date?
     var proposedLocation: GeoPoint?
     var proposedCaption: String?
@@ -184,7 +185,59 @@ struct MergeProposal: Codable, Identifiable, Equatable, Sendable {
     var conflicts: [MetadataConflict]
     var isApproved: Bool
 
-    var canApply: Bool { conflicts.isEmpty && isApproved }
+    var selectedDonors: [AssetSnapshot] { donors.filter { donorIDsToDelete.contains($0.id) } }
+    var retainedCandidates: [AssetSnapshot] { donors.filter { !donorIDsToDelete.contains($0.id) } }
+    var canApprove: Bool { conflicts.isEmpty && !selectedDonors.isEmpty }
+    var canApply: Bool { canApprove && isApproved }
+}
+
+extension MergeProposal {
+    private enum CodingKeys: String, CodingKey {
+        case id, groupID, confidence, keeper, donors, donorIDsToDelete
+        case proposedCreationDate, proposedLocation, proposedCaption, proposedRating
+        case proposedFavorite, proposedHidden, proposedKeywords, albumsToAdd, conflicts, isApproved
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        groupID = try container.decode(UUID.self, forKey: .groupID)
+        confidence = try container.decode(MatchConfidence.self, forKey: .confidence)
+        keeper = try container.decode(AssetSnapshot.self, forKey: .keeper)
+        donors = try container.decode([AssetSnapshot].self, forKey: .donors)
+        donorIDsToDelete = try container.decodeIfPresent(Set<String>.self, forKey: .donorIDsToDelete)
+            ?? Set(donors.map(\.id))
+        proposedCreationDate = try container.decodeIfPresent(Date.self, forKey: .proposedCreationDate)
+        proposedLocation = try container.decodeIfPresent(GeoPoint.self, forKey: .proposedLocation)
+        proposedCaption = try container.decodeIfPresent(String.self, forKey: .proposedCaption)
+        proposedRating = try container.decodeIfPresent(Int.self, forKey: .proposedRating)
+        proposedFavorite = try container.decode(Bool.self, forKey: .proposedFavorite)
+        proposedHidden = try container.decode(Bool.self, forKey: .proposedHidden)
+        proposedKeywords = try container.decode([String].self, forKey: .proposedKeywords)
+        albumsToAdd = try container.decode([AlbumReference].self, forKey: .albumsToAdd)
+        conflicts = try container.decode([MetadataConflict].self, forKey: .conflicts)
+        isApproved = try container.decode(Bool.self, forKey: .isApproved)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(groupID, forKey: .groupID)
+        try container.encode(confidence, forKey: .confidence)
+        try container.encode(keeper, forKey: .keeper)
+        try container.encode(donors, forKey: .donors)
+        try container.encode(donorIDsToDelete, forKey: .donorIDsToDelete)
+        try container.encodeIfPresent(proposedCreationDate, forKey: .proposedCreationDate)
+        try container.encodeIfPresent(proposedLocation, forKey: .proposedLocation)
+        try container.encodeIfPresent(proposedCaption, forKey: .proposedCaption)
+        try container.encodeIfPresent(proposedRating, forKey: .proposedRating)
+        try container.encode(proposedFavorite, forKey: .proposedFavorite)
+        try container.encode(proposedHidden, forKey: .proposedHidden)
+        try container.encode(proposedKeywords, forKey: .proposedKeywords)
+        try container.encode(albumsToAdd, forKey: .albumsToAdd)
+        try container.encode(conflicts, forKey: .conflicts)
+        try container.encode(isApproved, forKey: .isApproved)
+    }
 }
 
 enum JournalStatus: String, Codable, Sendable {
@@ -202,8 +255,8 @@ struct CleanupJournalEntry: Codable, Identifiable, Sendable {
     var errorMessage: String?
 }
 
-struct ScanScope: Equatable, Sendable {
-    enum Kind: String, CaseIterable, Identifiable, Sendable {
+struct ScanScope: Codable, Equatable, Sendable {
+    enum Kind: String, Codable, CaseIterable, Identifiable, Sendable {
         case entireLibrary
         case selectedAlbums
 
@@ -218,6 +271,17 @@ struct ScanScope: Equatable, Sendable {
 
     var kind: Kind = .entireLibrary
     var albumIDs: Set<String> = []
+}
+
+struct SavedReviewSession: Codable, Sendable {
+    static let schemaVersion = 1
+
+    var schemaVersion: Int = SavedReviewSession.schemaVersion
+    var matcherVersion: Int = MediaFingerprint.matcherVersion
+    var savedAt: Date
+    var lastScanDate: Date
+    var scope: ScanScope
+    var proposals: [MergeProposal]
 }
 
 struct ScanProgress: Equatable, Sendable {

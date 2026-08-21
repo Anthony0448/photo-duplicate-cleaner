@@ -6,10 +6,11 @@ A local macOS app for reviewing duplicate media in the System Photo Library, pre
 
 - Scanning and fingerprinting are read-only.
 - The app never opens or edits the private `.photoslibrary` database; all access goes through Apple's PhotoKit framework.
-- Exact and likely-visual matches are shown separately. Likely matches are never approved automatically.
+- Exact and likely-visual matches are shown separately. Choosing a keeper marks every other copy for deletion; use **Undo Delete** on any copy you want to retain.
 - Conflicting dates, locations, captions, ratings, hidden states, formats, and edits block cleanup until you choose a value.
 - Favorites, keywords, and writable user-album membership are unioned onto the keeper.
 - A journal is written before every cleanup transaction. It records metadata and identifiers, not media files.
+- Completed comparison results and all review choices are remembered across launches. **Rescan** is a manual action and replaces the remembered results only after a new scan completes successfully.
 - Deleted media must be restored in Photos before Apple permanently removes it. The app can restore journaled keeper metadata, but it cannot restore permanently deleted image/video data.
 
 Back up the Photos library before the first large cleanup. Start with a small test album and inspect its results on every synced device.
@@ -47,8 +48,10 @@ On this Mac's currently mismatched toolchain, use `Scripts/test-current-toolchai
 1. Open the app and grant full Photos read/write access.
 2. Scan the personal library or select writable albums.
 3. Wait while thumbnails are fingerprinted and only candidate originals are hashed.
-4. Review the recommended keeper in every group. Resolve all highlighted conflicts.
-5. Include reviewed groups in a batch, inspect the final summary, and confirm.
+4. Click the keeper card, then explicitly mark each other copy **Delete This Copy** or leave it as **Keep**.
+5. Resolve highlighted metadata conflicts, click **Add to Cleanup Batch & Next**, inspect the final batch summary, and confirm.
 6. Verify keepers and Recently Deleted in Photos, then export the JSON/CSV journal.
+
+After the first scan made with version 1.3 or later, relaunching the app restores the same albums, groups, keeper/delete choices, metadata resolutions, and cleanup-batch selections without rescanning.
 
 The app excludes shared/synced-library sources, faces, Memories, Google Takeout JSON sidecars, and permanent deletion.

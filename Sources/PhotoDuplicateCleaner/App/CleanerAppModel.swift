@@ -22,6 +22,8 @@ final class CleanerAppModel: ObservableObject {
     @Published var isPaused = false
     @Published var journalEntries: [CleanupJournalEntry] = []
     @Published var showingConfirmation = false
+    @Published var showingRescanConfirmation = false
+    @Published var lastScanDate: Date?
 
     let library: PhotoLibraryClient
     private let fingerprinting: Fingerprinting
@@ -29,13 +31,15 @@ final class CleanerAppModel: ObservableObject {
     private let planner: MergePlanner
     private let cache: InventoryCache
     private let journal: JournalStore
+    private let reviewSessionStore: ReviewSessionStore
     private var scanTask: Task<Void, Never>?
 
     init(
         library: PhotoLibraryClient = PhotoKitLibraryClient(),
         fingerprinting: Fingerprinting = MediaFingerprinter(),
         cache: InventoryCache = JSONInventoryCache(),
-        journal: JournalStore = JSONJournalStore()
+        journal: JournalStore = JSONJournalStore(),
+        reviewSessionStore: ReviewSessionStore = JSONReviewSessionStore()
     ) {
         self.library = library
         self.fingerprinting = fingerprinting
@@ -43,8 +47,16 @@ final class CleanerAppModel: ObservableObject {
         self.planner = FidelityMergePlanner()
         self.cache = cache
         self.journal = journal
+        self.reviewSessionStore = reviewSessionStore
         self.authorization = library.authorizationStatus()
         self.journalEntries = (try? journal.load()) ?? []
+        if let session = try? reviewSessionStore.load() {
+            self.scope = session.scope
+            self.proposals = session.proposals
+            self.lastScanDate = session.lastScanDate
+            self.selectedProposalID = session.proposals.first?.id
+            self.state = .review
+        }
     }
 
     var approvedProposals: [MergeProposal] { proposals.filter(\.canApply) }
@@ -54,6 +66,15 @@ final class CleanerAppModel: ObservableObject {
     }
     var exactCount: Int { proposals.filter { $0.confidence != .likelyVisual }.count }
     var likelyCount: Int { proposals.filter { $0.confidence == .likelyVisual }.count }
+    var hasSavedScan: Bool { lastScanDate != nil }
+
+    func bootstrap() {
+        guard authorization == .authorized, albums.isEmpty else { return }
+        Task {
+            do { albums = try await library.fetchAlbums() }
+            catch { state = .failed(error.localizedDescription) }
+        }
+    }
 
     func requestAccessAndLoadAlbums() {
         Task {
@@ -74,6 +95,16 @@ final class CleanerAppModel: ObservableObject {
         scanTask = Task { await scan() }
     }
 
+    func requestScan() {
+        if hasSavedScan { showingRescanConfirmation = true }
+        else { startScan() }
+    }
+
+    func confirmRescan() {
+        showingRescanConfirmation = false
+        startScan()
+    }
+
     func pauseOrResume() { isPaused.toggle() }
 
     func cancelScan() {
@@ -81,7 +112,7 @@ final class CleanerAppModel: ObservableObject {
         scanTask = nil
         isPaused = false
         progress = nil
-        state = proposals.isEmpty ? .idle : .review
+        state = hasSavedScan ? .review : .idle
     }
 
     func toggleAlbum(_ albumID: String) {
@@ -91,16 +122,40 @@ final class CleanerAppModel: ObservableObject {
 
     func chooseKeeper(proposalID: UUID, assetID: String) {
         guard let index = proposals.firstIndex(where: { $0.id == proposalID }) else { return }
+        let current = proposals[index]
+        guard current.keeper.id != assetID else { return }
         let group = DuplicateGroup(
-            id: proposals[index].groupID,
-            confidence: proposals[index].confidence,
-            assets: [proposals[index].keeper] + proposals[index].donors,
+            id: current.groupID,
+            confidence: current.confidence,
+            assets: [current.keeper] + current.donors,
             evidence: []
         )
-        var replacement = planner.proposal(for: group, keeperID: assetID)
+        let deletionIDs = Set(group.assets.map(\.id)).subtracting([assetID])
+        var replacement = planner.proposal(for: group, keeperID: assetID, deleting: deletionIDs)
         replacement.id = proposalID
         replacement.isApproved = false
         proposals[index] = replacement
+        persistReviewSession()
+    }
+
+    func toggleDeletion(proposalID: UUID, assetID: String) {
+        guard let index = proposals.firstIndex(where: { $0.id == proposalID }) else { return }
+        let current = proposals[index]
+        guard current.keeper.id != assetID else { return }
+        var deletionIDs = current.donorIDsToDelete
+        if deletionIDs.contains(assetID) { deletionIDs.remove(assetID) }
+        else { deletionIDs.insert(assetID) }
+        let group = DuplicateGroup(
+            id: current.groupID,
+            confidence: current.confidence,
+            assets: [current.keeper] + current.donors,
+            evidence: []
+        )
+        var replacement = planner.proposal(for: group, keeperID: current.keeper.id, deleting: deletionIDs)
+        replacement.id = proposalID
+        replacement.isApproved = false
+        proposals[index] = replacement
+        persistReviewSession()
     }
 
     func resolve(_ conflict: MetadataConflict, proposalID: UUID, using assetID: String) {
@@ -121,17 +176,37 @@ final class CleanerAppModel: ObservableObject {
         }
         proposals[index].conflicts.removeAll { $0.field == conflict.field }
         proposals[index].isApproved = false
+        persistReviewSession()
     }
 
     func setApproved(_ approved: Bool, proposalID: UUID) {
-        guard let index = proposals.firstIndex(where: { $0.id == proposalID }), proposals[index].conflicts.isEmpty else { return }
+        guard let index = proposals.firstIndex(where: { $0.id == proposalID }), proposals[index].canApprove else { return }
         proposals[index].isApproved = approved
+        persistReviewSession()
+    }
+
+    func approveAndAdvance(proposalID: UUID) {
+        setApproved(true, proposalID: proposalID)
+        guard proposals.first(where: { $0.id == proposalID })?.isApproved == true else { return }
+        selectAdjacent(to: proposalID, offset: 1, preferUnapproved: true)
+    }
+
+    func selectAdjacent(to proposalID: UUID, offset: Int, preferUnapproved: Bool = false) {
+        guard let currentIndex = proposals.firstIndex(where: { $0.id == proposalID }), !proposals.isEmpty else { return }
+        if preferUnapproved {
+            let following = proposals.dropFirst(currentIndex + 1).first { !$0.isApproved }
+            let wrapped = proposals.prefix(currentIndex).first { !$0.isApproved }
+            if let next = following ?? wrapped { selectedProposalID = next.id; return }
+        }
+        let nextIndex = min(max(currentIndex + offset, 0), proposals.count - 1)
+        selectedProposalID = proposals[nextIndex].id
     }
 
     func approveAllConflictFreeExact() {
         for index in proposals.indices where proposals[index].confidence != .likelyVisual && proposals[index].conflicts.isEmpty {
             proposals[index].isApproved = true
         }
+        persistReviewSession()
     }
 
     func applyApproved() {
@@ -150,6 +225,7 @@ final class CleanerAppModel: ObservableObject {
                 journalEntries = try journal.load()
                 selectedProposalID = proposals.first?.id
                 state = .review
+                persistReviewSession()
             } catch {
                 try? journal.mark(entries.map(\.id), status: .failed, error: error.localizedDescription)
                 journalEntries = (try? journal.load()) ?? journalEntries
@@ -182,13 +258,11 @@ final class CleanerAppModel: ObservableObject {
     }
 
     func dismissError() {
-        state = proposals.isEmpty ? .idle : .review
+        state = hasSavedScan ? .review : .idle
     }
 
     private func scan() async {
         state = .scanning
-        proposals = []
-        selectedProposalID = nil
         isPaused = false
         do {
             if library.authorizationStatus() != .authorized {
@@ -258,13 +332,15 @@ final class CleanerAppModel: ObservableObject {
 
             progress = .init(phase: .matching, completed: 1, total: 1, detail: "Building review groups")
             let finalGroups = matcher.groups(in: assets)
-            proposals = finalGroups.map { planner.proposal(for: $0, keeperID: nil) }
+            proposals = finalGroups.map { planner.proposal(for: $0, keeperID: nil, deleting: nil) }
             selectedProposalID = proposals.first?.id
+            lastScanDate = Date()
             progress = nil
             state = .review
+            persistReviewSession()
         } catch is CancellationError {
             progress = nil
-            state = .idle
+            state = hasSavedScan ? .review : .idle
         } catch {
             progress = nil
             state = .failed(error.localizedDescription)
@@ -276,5 +352,17 @@ final class CleanerAppModel: ObservableObject {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 200_000_000)
         }
+    }
+
+    private func persistReviewSession() {
+        guard let lastScanDate else { return }
+        let session = SavedReviewSession(
+            savedAt: Date(),
+            lastScanDate: lastScanDate,
+            scope: scope,
+            proposals: proposals
+        )
+        do { try reviewSessionStore.save(session) }
+        catch { state = .failed("The remembered scan could not be saved: \(error.localizedDescription)") }
     }
 }

@@ -151,7 +151,7 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
             throw CleanerError.invalidProposal("Every item must be approved and conflict-free.")
         }
 
-        let allSnapshots = proposals.flatMap { [$0.keeper] + $0.donors }
+        let allSnapshots = proposals.flatMap { [$0.keeper] + $0.selectedDonors }
         let ids = allSnapshots.map(\.id)
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
         var assetsByID: [String: PHAsset] = [:]
@@ -195,7 +195,7 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
                               let collectionRequest = PHAssetCollectionChangeRequest(for: collection) else { continue }
                         collectionRequest.addAssets([keeper] as NSArray)
                     }
-                    let donors = proposal.donors.compactMap { assetsByID[$0.id] }
+                    let donors = proposal.selectedDonors.compactMap { assetsByID[$0.id] }
                     PHAssetChangeRequest.deleteAssets(donors as NSArray)
                 }
             } completionHandler: { success, error in

@@ -7,6 +7,42 @@ enum AppStoragePaths {
     }()
     static let inventory = root.appendingPathComponent("inventory-v1.json")
     static let journal = root.appendingPathComponent("cleanup-journal-v1.json")
+    static let reviewSession = root.appendingPathComponent("review-session-v1.json")
+}
+
+final class JSONReviewSessionStore: ReviewSessionStore {
+    private let url: URL
+    init(url: URL = AppStoragePaths.reviewSession) { self.url = url }
+
+    func load() throws -> SavedReviewSession? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let session = try Self.decoder.decode(SavedReviewSession.self, from: Data(contentsOf: url))
+        guard session.schemaVersion == SavedReviewSession.schemaVersion,
+              session.matcherVersion == MediaFingerprint.matcherVersion else { return nil }
+        return session
+    }
+
+    func save(_ session: SavedReviewSession) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.encoder.encode(session).write(to: url, options: .atomic)
+    }
+
+    func clear() throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    private static let encoder: JSONEncoder = {
+        let value = JSONEncoder()
+        value.dateEncodingStrategy = .iso8601
+        value.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return value
+    }()
+    private static let decoder: JSONDecoder = {
+        let value = JSONDecoder()
+        value.dateDecodingStrategy = .iso8601
+        return value
+    }()
 }
 
 final class JSONInventoryCache: InventoryCache {
@@ -89,7 +125,7 @@ final class JSONJournalStore: JournalStore {
                 proposal.confidence.rawValue,
                 proposal.keeper.id,
                 proposal.keeper.originalFilename,
-                proposal.donors.map(\.id).joined(separator: "|"),
+                proposal.selectedDonors.map(\.id).joined(separator: "|"),
                 proposal.proposedCreationDate.map(formatter.string) ?? "",
                 proposal.proposedLocation.map { String($0.latitude) } ?? "",
                 proposal.proposedLocation.map { String($0.longitude) } ?? "",
