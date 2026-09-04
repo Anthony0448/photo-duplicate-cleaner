@@ -357,11 +357,19 @@ final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader,
         originalFilename = resources.first?.originalFilename ?? "Untitled"
 #endif
         let contentType: String
+#if PHOTO_EXTENDED_METADATA
         if #available(macOS 26.0, *) { contentType = asset.contentType.identifier }
         else { contentType = resources.first?.uniformTypeIdentifier ?? "public.data" }
+#else
+        contentType = resources.first?.uniformTypeIdentifier ?? "public.data"
+#endif
         let addedDate: Date?
+#if PHOTO_EXTENDED_METADATA
         if #available(macOS 26.0, *) { addedDate = asset.addedDate }
         else { addedDate = nil }
+#else
+        addedDate = nil
+#endif
         let isRaw = manifests.contains { manifest in
             manifest.uniformTypeIdentifier.localizedCaseInsensitiveContains("raw")
                 || ["dng", "cr2", "cr3", "nef", "arw", "raf"].contains((manifest.filename as NSString).pathExtension.lowercased())
@@ -462,7 +470,9 @@ final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader,
     }
 
     private static func resourceUTI(_ resource: PHAssetResource) -> String {
+#if PHOTO_EXTENDED_METADATA
         if #available(macOS 26.0, *) { return resource.contentType.identifier }
+#endif
         return resource.uniformTypeIdentifier
     }
 
