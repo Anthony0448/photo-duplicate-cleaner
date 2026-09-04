@@ -38,6 +38,7 @@ private struct LiquidGlassSurface: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
+#if PHOTO_MODERN_UI
         if #available(macOS 26.0, *) {
             content
                 .glassEffect(
@@ -53,6 +54,15 @@ private struct LiquidGlassSurface: ViewModifier {
                 }
                 .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
         }
+#else
+        content
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(.white.opacity(0.16), lineWidth: 0.8)
+            }
+            .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
+#endif
     }
 }
 

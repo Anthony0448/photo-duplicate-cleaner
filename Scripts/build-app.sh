@@ -17,9 +17,13 @@ fi
 sdk_major="${sdk_version%%.*}"
 swift_args=()
 
+if [[ "$sdk_major" == <-> ]] && (( sdk_major >= 26 )); then
+    swift_args+=(-Xswiftc -DPHOTO_MODERN_UI)
+fi
 if [[ "$sdk_major" == <-> ]] && (( sdk_major >= 27 )); then
-    swift_args=(-Xswiftc -DPHOTO_EXTENDED_METADATA)
-else
+    swift_args+=(-Xswiftc -DPHOTO_EXTENDED_METADATA)
+fi
+if [[ "$sdk_major" != <-> ]] || (( sdk_major < 27 )); then
     echo "Building with macOS SDK $sdk_version; macOS 27-only metadata fields are disabled." >&2
 fi
 
