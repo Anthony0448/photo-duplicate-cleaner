@@ -33,16 +33,8 @@ final class ConservativeDuplicateMatcher: DuplicateMatcher {
             guard let hash = assets[index].fingerprint?.perceptualHash else { continue }
             for band in 0..<4 {
                 let value = (hash >> UInt64(band * 16)) & 0xffff
-                let durationBucket = assets[index].mediaKind == .video
-                    ? Int((assets[index].duration / 0.25).rounded())
-                    : 0
-                let durationBuckets = assets[index].mediaKind == .video
-                    ? [durationBucket - 1, durationBucket, durationBucket + 1]
-                    : [0]
-                for bucket in durationBuckets {
-                    let key = "\(assets[index].mediaKind.rawValue):\(band):\(value):\(bucket)"
-                    localityBuckets[key, default: []].append(index)
-                }
+                let key = "\(assets[index].mediaKind.rawValue):\(band):\(value)"
+                localityBuckets[key, default: []].append(index)
             }
         }
 
@@ -60,6 +52,12 @@ final class ConservativeDuplicateMatcher: DuplicateMatcher {
         let components = Dictionary(grouping: assets.indices, by: { union.find($0) })
         return components.values.compactMap { indices in
             guard indices.count > 1 else { return nil }
+            let componentAssets = indices.map { assets[$0] }
+            if componentAssets.first?.mediaKind == .video {
+                let durations = componentAssets.map(\.duration)
+                guard let shortest = durations.min(), let longest = durations.max(),
+                      Self.videoDurationsMatch(shortest, longest) else { return nil }
+            }
             let relevant = edges.filter { indices.contains($0.0) && indices.contains($0.1) }
             guard !relevant.isEmpty else { return nil }
             let confidence: MatchConfidence
@@ -73,7 +71,7 @@ final class ConservativeDuplicateMatcher: DuplicateMatcher {
             return DuplicateGroup(
                 id: UUID(),
                 confidence: confidence,
-                assets: indices.map { assets[$0] },
+                assets: componentAssets,
                 evidence: Array(Set(relevant.flatMap(\.3))).sorted()
             )
         }.sorted { lhs, rhs in
@@ -124,15 +122,18 @@ final class ConservativeDuplicateMatcher: DuplicateMatcher {
         }
 
         if lhs.mediaKind == .video {
-            let allowedDuration = max(Self.videoDurationSeconds, max(lhs.duration, rhs.duration) * Self.videoDurationFraction)
-            guard abs(lhs.duration - rhs.duration) <= allowedDuration,
+            guard Self.videoDurationsMatch(lhs.duration, rhs.duration),
                   leftFingerprint.videoFrameHashes.count == 3,
                   rightFingerprint.videoFrameHashes.count == 3 else { return nil }
             let distances = zip(leftFingerprint.videoFrameHashes, rightFingerprint.videoFrameHashes)
                 .map { Self.hammingDistance($0, $1) }
             guard distances.max() ?? .max <= Self.videoFrameMaxDistance,
                   Double(distances.reduce(0, +)) / 3.0 <= Self.videoFrameMeanDistance else { return nil }
-            return (.likelyVisual, ["Duration, aspect ratio, and sampled video frames closely match."])
+            let delta = abs(lhs.duration - rhs.duration)
+            let tolerance = Self.videoDurationTolerance(lhs.duration, rhs.duration)
+            return (.likelyVisual, [
+                String(format: "Video durations differ by %.2fs (%.2fs vs %.2fs), within the %.2fs tolerance; aspect ratio and sampled frames also match.", delta, lhs.duration, rhs.duration, tolerance)
+            ])
         }
 
         let hamming = Self.hammingDistance(leftHash, rightHash)
@@ -149,6 +150,15 @@ final class ConservativeDuplicateMatcher: DuplicateMatcher {
 
     static func hammingDistance(_ lhs: UInt64, _ rhs: UInt64) -> Int {
         (lhs ^ rhs).nonzeroBitCount
+    }
+
+    static func videoDurationTolerance(_ lhs: Double, _ rhs: Double) -> Double {
+        max(videoDurationSeconds, max(lhs, rhs) * videoDurationFraction)
+    }
+
+    static func videoDurationsMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        guard lhs.isFinite, rhs.isFinite, lhs > 0, rhs > 0 else { return false }
+        return abs(lhs - rhs) <= videoDurationTolerance(lhs, rhs)
     }
 
     static func lumaSimilarity(_ lhs: [UInt8], _ rhs: [UInt8]) -> Double {

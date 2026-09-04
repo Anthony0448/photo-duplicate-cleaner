@@ -23,6 +23,8 @@ final class CleanerAppModel: ObservableObject {
     @Published var journalEntries: [CleanupJournalEntry] = []
     @Published var showingConfirmation = false
     @Published var showingRescanConfirmation = false
+    @Published var showingLibraryChangeRescanPrompt = false
+    @Published private(set) var libraryResultsAreStale = false
     @Published var lastScanDate: Date?
 
     let library: PhotoLibraryClient
@@ -33,6 +35,11 @@ final class CleanerAppModel: ObservableObject {
     private let journal: JournalStore
     private let reviewSessionStore: ReviewSessionStore
     private var scanTask: Task<Void, Never>?
+    private var pendingLibraryChangePrompt = false
+    private var hasPromptedForCurrentStaleness = false
+    private var libraryChangedDuringScan = false
+    private var savedLibraryRevision: String?
+    private var savedScanCouldNotBeVerified = false
 
     init(
         library: PhotoLibraryClient = PhotoKitLibraryClient(),
@@ -55,6 +62,7 @@ final class CleanerAppModel: ObservableObject {
             self.proposals = session.proposals
             self.lastScanDate = session.lastScanDate
             self.selectedProposalID = session.proposals.first?.id
+            self.savedLibraryRevision = session.libraryRevision
             self.state = .review
         }
     }
@@ -67,11 +75,26 @@ final class CleanerAppModel: ObservableObject {
     var exactCount: Int { proposals.filter { $0.confidence != .likelyVisual }.count }
     var likelyCount: Int { proposals.filter { $0.confidence == .likelyVisual }.count }
     var hasSavedScan: Bool { lastScanDate != nil }
+    var libraryChangePromptMessage: String {
+        if libraryChangedDuringScan {
+            return "Photos changed while the comparison was running, so that scan was stopped before it could replace your remembered results. Run a fresh scan against the updated library."
+        }
+        if savedScanCouldNotBeVerified {
+            return "This remembered scan was created before library change tracking was available. Your review choices are preserved, but run a fresh scan once to establish a verified baseline."
+        }
+        return "Photos changed since these results were created. Your remembered review choices are preserved, but cleanup is paused until a fresh scan verifies the selected scope."
+    }
 
     func bootstrap() {
-        guard authorization == .authorized, albums.isEmpty else { return }
+        guard authorization == .authorized else { return }
         Task {
-            do { albums = try await library.fetchAlbums() }
+            do {
+                if albums.isEmpty { albums = try await library.fetchAlbums() }
+                if hasSavedScan {
+                    try beginObservingLibraryChanges()
+                    try await validateSavedLibraryRevision()
+                }
+            }
             catch { state = .failed(error.localizedDescription) }
         }
     }
@@ -85,13 +108,24 @@ final class CleanerAppModel: ObservableObject {
                     : CleanerError.photoAccessRequired.localizedDescription)
                 return
             }
-            do { albums = try await library.fetchAlbums() }
+            do {
+                albums = try await library.fetchAlbums()
+                if hasSavedScan {
+                    try beginObservingLibraryChanges()
+                    try await validateSavedLibraryRevision()
+                }
+            }
             catch { state = .failed(error.localizedDescription) }
         }
     }
 
     func startScan() {
         scanTask?.cancel()
+        showingLibraryChangeRescanPrompt = false
+        pendingLibraryChangePrompt = false
+        hasPromptedForCurrentStaleness = false
+        libraryChangedDuringScan = false
+        savedScanCouldNotBeVerified = false
         scanTask = Task { await scan() }
     }
 
@@ -105,6 +139,15 @@ final class CleanerAppModel: ObservableObject {
         startScan()
     }
 
+    func rescanAfterLibraryChange() {
+        showingLibraryChangeRescanPrompt = false
+        startScan()
+    }
+
+    func deferLibraryChangeRescan() {
+        showingLibraryChangeRescanPrompt = false
+    }
+
     func pauseOrResume() { isPaused.toggle() }
 
     func cancelScan() {
@@ -113,6 +156,7 @@ final class CleanerAppModel: ObservableObject {
         isPaused = false
         progress = nil
         state = hasSavedScan ? .review : .idle
+        presentPendingLibraryChangePromptIfPossible()
     }
 
     func toggleAlbum(_ albumID: String) {
@@ -211,7 +255,7 @@ final class CleanerAppModel: ObservableObject {
 
     func applyApproved() {
         let approved = approvedProposals
-        guard !approved.isEmpty else { return }
+        guard !approved.isEmpty, !libraryResultsAreStale else { return }
         state = .applying
         showingConfirmation = false
         Task {
@@ -226,6 +270,7 @@ final class CleanerAppModel: ObservableObject {
                 selectedProposalID = proposals.first?.id
                 state = .review
                 persistReviewSession()
+                presentPendingLibraryChangePromptIfPossible()
             } catch {
                 try? journal.mark(entries.map(\.id), status: .failed, error: error.localizedDescription)
                 journalEntries = (try? journal.load()) ?? journalEntries
@@ -259,6 +304,7 @@ final class CleanerAppModel: ObservableObject {
 
     func dismissError() {
         state = hasSavedScan ? .review : .idle
+        presentPendingLibraryChangePromptIfPossible()
     }
 
     private func scan() async {
@@ -276,6 +322,7 @@ final class CleanerAppModel: ObservableObject {
             if scope.kind == .selectedAlbums && scope.albumIDs.isEmpty {
                 throw CleanerError.invalidProposal("Select at least one album to scan.")
             }
+            try beginObservingLibraryChanges()
 
             progress = .init(phase: .inventory, completed: 0, total: 1, detail: "Reading Photos metadata")
             var assets = try await library.fetchAssets(scope: scope)
@@ -307,7 +354,11 @@ final class CleanerAppModel: ObservableObject {
                     if assets[index].mediaKind == .video {
                         images = try await library.videoFrames(assetID: assets[index].id)
                     } else {
-                        images = [try await library.thumbnail(assetID: assets[index].id, targetSize: .init(width: 512, height: 512))]
+                        images = [try await library.thumbnail(
+                            assetID: assets[index].id,
+                            targetSize: .init(width: 512, height: 512),
+                            networkAccessAllowed: true
+                        )]
                     }
                     assets[index].fingerprint = try await fingerprinting.fingerprint(asset: assets[index], images: images)
                 }
@@ -335,12 +386,19 @@ final class CleanerAppModel: ObservableObject {
             proposals = finalGroups.map { planner.proposal(for: $0, keeperID: nil, deleting: nil) }
             selectedProposalID = proposals.first?.id
             lastScanDate = Date()
+            savedLibraryRevision = LibraryRevision.signature(for: assets)
+            libraryResultsAreStale = false
+            pendingLibraryChangePrompt = false
+            hasPromptedForCurrentStaleness = false
+            libraryChangedDuringScan = false
+            savedScanCouldNotBeVerified = false
             progress = nil
             state = .review
             persistReviewSession()
         } catch is CancellationError {
             progress = nil
             state = hasSavedScan ? .review : .idle
+            presentPendingLibraryChangePromptIfPossible()
         } catch {
             progress = nil
             state = .failed(error.localizedDescription)
@@ -354,13 +412,58 @@ final class CleanerAppModel: ObservableObject {
         }
     }
 
+    private func beginObservingLibraryChanges() throws {
+        try library.startObservingChanges(scope: scope) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleLibraryChange()
+            }
+        }
+    }
+
+    private func validateSavedLibraryRevision() async throws {
+        let currentAssets = try await library.fetchAssets(scope: scope)
+        let currentRevision = LibraryRevision.signature(for: currentAssets)
+        guard let savedLibraryRevision else {
+            savedScanCouldNotBeVerified = true
+            handleLibraryChange()
+            return
+        }
+        guard savedLibraryRevision == currentRevision else {
+            handleLibraryChange()
+            return
+        }
+    }
+
+    private func handleLibraryChange() {
+        guard hasSavedScan || state == .scanning else { return }
+        libraryResultsAreStale = true
+        showingConfirmation = false
+        if state == .scanning {
+            libraryChangedDuringScan = true
+            scanTask?.cancel()
+        }
+        guard !hasPromptedForCurrentStaleness else { return }
+        pendingLibraryChangePrompt = true
+        presentPendingLibraryChangePromptIfPossible()
+    }
+
+    private func presentPendingLibraryChangePromptIfPossible() {
+        guard pendingLibraryChangePrompt,
+              !hasPromptedForCurrentStaleness,
+              state == .idle || state == .review else { return }
+        pendingLibraryChangePrompt = false
+        hasPromptedForCurrentStaleness = true
+        showingLibraryChangeRescanPrompt = true
+    }
+
     private func persistReviewSession() {
         guard let lastScanDate else { return }
         let session = SavedReviewSession(
             savedAt: Date(),
             lastScanDate: lastScanDate,
             scope: scope,
-            proposals: proposals
+            proposals: proposals,
+            libraryRevision: savedLibraryRevision
         )
         do { try reviewSessionStore.save(session) }
         catch { state = .failed("The remembered scan could not be saved: \(error.localizedDescription)") }

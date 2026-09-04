@@ -2,3 +2,7 @@
 dist/
 .DS_Store
 *.xcuserstate
+*.swp
+*.xccheckout
+DerivedData/
+.swiftpm/

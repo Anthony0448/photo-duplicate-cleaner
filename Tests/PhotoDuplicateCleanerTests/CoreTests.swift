@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import Testing
 @testable import PhotoDuplicateCleaner
@@ -70,6 +71,53 @@ struct CoreTests {
         let groups = matcher.groups(in: [first, second])
 
         #expect(groups.first?.confidence == .likelyVisual)
+        #expect(groups.first?.evidence.contains { $0.contains("10.00s vs 10.10s") } == true)
+    }
+
+    @Test func videoDurationDifferenceRejectsOtherwiseSimilarFrames() {
+        let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
+        var first = fixture(id: "one", resourceHash: nil)
+        var second = fixture(id: "two", resourceHash: nil)
+        first.mediaKind = .video
+        second.mediaKind = .video
+        first.duration = 10
+        second.duration = 10.4
+        first.fingerprint = MediaFingerprint(perceptualHash: 0x1000, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+        second.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+
+        #expect(matcher.groups(in: [first, second]).isEmpty)
+    }
+
+    @Test func longVideosUsePercentageBasedDurationTolerance() {
+        let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
+        var first = fixture(id: "one", resourceHash: nil)
+        var second = fixture(id: "two", resourceHash: nil)
+        first.mediaKind = .video
+        second.mediaKind = .video
+        first.duration = 600
+        second.duration = 602
+        first.fingerprint = MediaFingerprint(perceptualHash: 0x1000, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+        second.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+
+        #expect(matcher.groups(in: [first, second]).first?.confidence == .likelyVisual)
+    }
+
+    @Test func videoGroupRejectsTransitiveDurationDrift() {
+        let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
+        var first = fixture(id: "one", resourceHash: nil)
+        var middle = fixture(id: "middle", resourceHash: nil)
+        var last = fixture(id: "last", resourceHash: nil)
+        first.mediaKind = .video
+        middle.mediaKind = .video
+        last.mediaKind = .video
+        first.duration = 10
+        middle.duration = 10.2
+        last.duration = 10.4
+        first.fingerprint = MediaFingerprint(perceptualHash: 0x1000, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+        middle.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+        last.fingerprint = MediaFingerprint(perceptualHash: 0x1003, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
+
+        #expect(matcher.groups(in: [first, middle, last]).isEmpty)
     }
 
     @Test func fidelityPolicyPrefersLivePhotoAndEdits() {
@@ -120,11 +168,27 @@ struct CoreTests {
 
         let proposal = planner.proposal(for: group, keeperID: keeper.id)
 
-        #expect(proposal.conflicts.isEmpty)
+        #expect(proposal.conflicts.contains { $0.field == .location })
         #expect(proposal.proposedCreationDate == donor.creationDate)
         #expect(proposal.proposedLocation == donor.location)
         #expect(proposal.proposedCaption == donor.caption)
         #expect(proposal.albumsToAdd.map(\.id) == ["album-b"])
+    }
+
+    @Test func plannerHighlightsLocationPresentOnOnlySomeCopies() {
+        let planner = FidelityMergePlanner()
+        var keeper = fixture(id: "keeper", resourceHash: "a")
+        keeper.location = nil
+        var donor = fixture(id: "donor", resourceHash: "b")
+        donor.location = .init(latitude: 34.05, longitude: -118.25)
+        let group = DuplicateGroup(id: UUID(), confidence: .contentExact, assets: [keeper, donor], evidence: [])
+
+        let proposal = planner.proposal(for: group, keeperID: keeper.id, deleting: [donor.id])
+
+        let conflict = proposal.conflicts.first { $0.field == .location }
+        #expect(conflict?.message == "Location is present on only some copies. Choose whether to preserve it.")
+        #expect(proposal.proposedLocation == donor.location)
+        #expect(!proposal.canApprove)
     }
 
     @Test func plannerAcceptsDateAndLocationWithinTolerance() {
@@ -267,6 +331,133 @@ struct CoreTests {
         #expect(try store.load() == nil)
     }
 
+    @Test @MainActor func photoLibraryChangePromptsOnceAndSuccessfulRescanClearsStaleness() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let reviewStore = JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
+        let keeper = fixture(id: "keeper", resourceHash: "same")
+        let donor = fixture(id: "donor", resourceHash: "same")
+        let proposal = MergeProposal(
+            id: UUID(), groupID: UUID(), confidence: .binaryExact, keeper: keeper, donors: [donor],
+            donorIDsToDelete: [donor.id],
+            proposedCreationDate: nil, proposedLocation: nil, proposedCaption: nil, proposedRating: nil,
+            proposedFavorite: false, proposedHidden: false, proposedKeywords: [], albumsToAdd: [], conflicts: [], isApproved: true
+        )
+        let scope = ScanScope(kind: .selectedAlbums, albumIDs: ["album-1"])
+        try reviewStore.save(.init(
+            savedAt: Date(),
+            lastScanDate: Date(),
+            scope: scope,
+            proposals: [proposal],
+            libraryRevision: LibraryRevision.signature(for: [keeper, donor])
+        ))
+        let library = ChangeObservingLibraryStub(assets: [keeper, donor])
+        let model = CleanerAppModel(
+            library: library,
+            fingerprinting: StubFingerprinter(),
+            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
+            reviewSessionStore: reviewStore
+        )
+
+        model.bootstrap()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        #expect(library.observedScope == scope)
+
+        library.emitChange()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        #expect(model.libraryResultsAreStale)
+        #expect(model.showingLibraryChangeRescanPrompt)
+
+        model.deferLibraryChangeRescan()
+        library.emitChange()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        #expect(!model.showingLibraryChangeRescanPrompt)
+
+        model.applyApproved()
+        #expect(library.applyCallCount == 0)
+
+        library.assets = []
+        model.rescanAfterLibraryChange()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(!model.libraryResultsAreStale)
+        #expect(model.state == .review)
+    }
+
+    @Test @MainActor func launchDetectsChangesMadeWhileAppWasClosed() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let reviewStore = JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
+        let scannedAsset = fixture(id: "keeper", resourceHash: "same")
+        var changedAsset = scannedAsset
+        changedAsset.isFavorite = true
+        let proposal = MergeProposal(
+            id: UUID(), groupID: UUID(), confidence: .binaryExact, keeper: scannedAsset, donors: [],
+            donorIDsToDelete: [],
+            proposedCreationDate: nil, proposedLocation: nil, proposedCaption: nil, proposedRating: nil,
+            proposedFavorite: false, proposedHidden: false, proposedKeywords: [], albumsToAdd: [], conflicts: [], isApproved: false
+        )
+        try reviewStore.save(.init(
+            savedAt: Date(),
+            lastScanDate: Date(),
+            scope: .init(),
+            proposals: [proposal],
+            libraryRevision: LibraryRevision.signature(for: [scannedAsset])
+        ))
+        let library = ChangeObservingLibraryStub(assets: [changedAsset])
+        let model = CleanerAppModel(
+            library: library,
+            fingerprinting: StubFingerprinter(),
+            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
+            reviewSessionStore: reviewStore
+        )
+
+        model.bootstrap()
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        #expect(model.libraryResultsAreStale)
+        #expect(model.showingLibraryChangeRescanPrompt)
+    }
+
+    @Test func libraryRevisionIsOrderIndependentButDetectsMetadataChanges() {
+        var first = fixture(id: "one", resourceHash: "old-hash")
+        let second = fixture(id: "two", resourceHash: "hash")
+        let original = LibraryRevision.signature(for: [first, second])
+
+        first.resources[0].sha256 = "newly-computed-hash"
+        let reordered = LibraryRevision.signature(for: [second, first])
+        #expect(original == reordered)
+
+        first.isFavorite = true
+        #expect(original != LibraryRevision.signature(for: [first, second]))
+    }
+
+    @Test @MainActor func changeDuringScanCancelsBeforePublishingResultsAndPromptsAgain() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let library = ChangeObservingLibraryStub()
+        library.fetchDelayNanoseconds = 1_000_000_000
+        let model = CleanerAppModel(
+            library: library,
+            fingerprinting: StubFingerprinter(),
+            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
+            reviewSessionStore: JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
+        )
+
+        model.startScan()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        #expect(model.state == .scanning)
+        #expect(library.observedScope != nil)
+
+        library.emitChange()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        #expect(model.state == .idle)
+        #expect(model.proposals.isEmpty)
+        #expect(model.libraryResultsAreStale)
+        #expect(model.showingLibraryChangeRescanPrompt)
+        #expect(model.libraryChangePromptMessage.contains("scan was stopped"))
+    }
+
     private func fixture(id: String, resourceHash: String?) -> AssetSnapshot {
         AssetSnapshot(
             id: id,
@@ -302,4 +493,44 @@ struct CoreTests {
 private struct StubFingerprinter: Fingerprinting {
     func fingerprint(asset: AssetSnapshot, images: [NSImage]) async throws -> MediaFingerprint { MediaFingerprint() }
     func visionDistance(_ lhs: MediaFingerprint, _ rhs: MediaFingerprint) -> Float? { 0 }
+}
+
+private final class ChangeObservingLibraryStub: PhotoLibraryClient {
+    var assets: [AssetSnapshot]
+    var fetchDelayNanoseconds: UInt64 = 0
+    private(set) var observedScope: ScanScope?
+    private(set) var applyCallCount = 0
+    private var changeHandler: (@Sendable () -> Void)?
+
+    init(assets: [AssetSnapshot] = []) {
+        self.assets = assets
+    }
+
+    func authorizationStatus() -> PhotoLibraryAccess { .authorized }
+    func requestAuthorization() async -> PhotoLibraryAccess { .authorized }
+    func fetchAlbums() async throws -> [AlbumReference] { [] }
+    func fetchAssets(scope: ScanScope) async throws -> [AssetSnapshot] {
+        if fetchDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: fetchDelayNanoseconds)
+        }
+        return assets
+    }
+    func thumbnail(assetID: String, targetSize: CGSize, networkAccessAllowed: Bool) async throws -> NSImage {
+        throw CleanerError.assetUnavailable(assetID)
+    }
+    func videoPlayerItem(assetID: String) async throws -> AVPlayerItem {
+        throw CleanerError.assetUnavailable(assetID)
+    }
+    func videoFrames(assetID: String) async throws -> [NSImage] {
+        throw CleanerError.assetUnavailable(assetID)
+    }
+    func updateOriginalHashes(for asset: AssetSnapshot) async throws -> AssetSnapshot { asset }
+    func apply(proposals: [MergeProposal]) async throws { applyCallCount += 1 }
+    func restoreKeeperMetadata(from entries: [CleanupJournalEntry]) async throws { }
+    func startObservingChanges(scope: ScanScope, handler: @escaping @Sendable () -> Void) throws {
+        observedScope = scope
+        changeHandler = handler
+    }
+
+    func emitChange() { changeHandler?() }
 }

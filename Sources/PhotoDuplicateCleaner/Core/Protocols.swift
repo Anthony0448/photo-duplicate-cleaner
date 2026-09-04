@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 
 enum PhotoLibraryAccess: Equatable, Sendable {
@@ -38,15 +39,17 @@ protocol PhotoLibraryClient: AnyObject {
     func requestAuthorization() async -> PhotoLibraryAccess
     func fetchAlbums() async throws -> [AlbumReference]
     func fetchAssets(scope: ScanScope) async throws -> [AssetSnapshot]
-    func thumbnail(assetID: String, targetSize: CGSize) async throws -> NSImage
+    func thumbnail(assetID: String, targetSize: CGSize, networkAccessAllowed: Bool) async throws -> NSImage
+    func videoPlayerItem(assetID: String) async throws -> AVPlayerItem
     func videoFrames(assetID: String) async throws -> [NSImage]
     func updateOriginalHashes(for asset: AssetSnapshot) async throws -> AssetSnapshot
     func apply(proposals: [MergeProposal]) async throws
     func restoreKeeperMetadata(from entries: [CleanupJournalEntry]) async throws
+    func startObservingChanges(scope: ScanScope, handler: @escaping @Sendable () -> Void) throws
 }
 
 protocol ResourceLoader {
-    func thumbnail(assetID: String, targetSize: CGSize) async throws -> NSImage
+    func thumbnail(assetID: String, targetSize: CGSize, networkAccessAllowed: Bool) async throws -> NSImage
     func videoFrames(assetID: String) async throws -> [NSImage]
     func updateOriginalHashes(for asset: AssetSnapshot) async throws -> AssetSnapshot
 }

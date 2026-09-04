@@ -70,7 +70,14 @@ final class FidelityMergePlanner: MergePlanner {
         if uniqueDates(assets.compactMap(\.creationDate)).count > 1 {
             conflicts.append(.init(field: .creationDate, message: "Capture dates differ by more than two seconds.", assetIDs: ids))
         }
-        if uniqueLocations(assets.compactMap(\.location)).count > 1 {
+        let locatedAssets = assets.filter { $0.location != nil }
+        let uniqueLocationCount = uniqueLocations(locatedAssets.compactMap(\.location)).count
+        if !locatedAssets.isEmpty && locatedAssets.count != assets.count {
+            let message = uniqueLocationCount > 1
+                ? "Some copies have no location, and the available locations differ. Choose the location to preserve."
+                : "Location is present on only some copies. Choose whether to preserve it."
+            conflicts.append(.init(field: .location, message: message, assetIDs: ids))
+        } else if uniqueLocationCount > 1 {
             conflicts.append(.init(field: .location, message: "Locations differ by more than 100 meters.", assetIDs: ids))
         }
         if Set(assets.compactMap { normalized($0.caption) }).count > 1 {

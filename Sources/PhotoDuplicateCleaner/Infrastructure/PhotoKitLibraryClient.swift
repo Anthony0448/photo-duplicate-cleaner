@@ -6,10 +6,25 @@ import Foundation
 import Photos
 import UniformTypeIdentifiers
 
-final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupApplier {
+final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader, CleanupApplier, PHPhotoLibraryChangeObserver {
     private let library = PHPhotoLibrary.shared()
     private let imageManager = PHCachingImageManager()
     private let resourceManager = PHAssetResourceManager.default()
+    private let observationLock = NSLock()
+    private var observedAssetFetchResults: [PHFetchResult<PHAsset>] = []
+    private var changeHandler: (@Sendable () -> Void)?
+    private var isRegisteredForChanges = false
+    private var observationGeneration = 0
+
+    override init() {
+        super.init()
+    }
+
+    deinit {
+        if isRegisteredForChanges {
+            library.unregisterChangeObserver(self)
+        }
+    }
 
     func authorizationStatus() -> PhotoLibraryAccess {
         Self.mapAuthorization(PHPhotoLibrary.authorizationStatus(for: .readWrite))
@@ -20,6 +35,52 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
                 continuation.resume(returning: Self.mapAuthorization(status))
             }
+        }
+    }
+
+    func startObservingChanges(scope: ScanScope, handler: @escaping @Sendable () -> Void) throws {
+        try requireAuthorization()
+        let fetchResults = assetFetchResults(for: scope)
+
+        observationLock.lock()
+        observedAssetFetchResults = fetchResults
+        changeHandler = handler
+        observationGeneration += 1
+        let shouldRegister = !isRegisteredForChanges
+        isRegisteredForChanges = true
+        observationLock.unlock()
+
+        if shouldRegister {
+            library.register(self)
+        }
+    }
+
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        observationLock.lock()
+        let fetchResults = observedAssetFetchResults
+        let handler = changeHandler
+        let generation = observationGeneration
+        observationLock.unlock()
+
+        var updatedFetchResults: [PHFetchResult<PHAsset>] = []
+        var relevantChangeDetected = false
+        for fetchResult in fetchResults {
+            if let details = changeInstance.changeDetails(for: fetchResult) {
+                updatedFetchResults.append(details.fetchResultAfterChanges)
+                relevantChangeDetected = true
+            } else {
+                updatedFetchResults.append(fetchResult)
+            }
+        }
+
+        observationLock.lock()
+        if generation == observationGeneration {
+            observedAssetFetchResults = updatedFetchResults
+        }
+        observationLock.unlock()
+
+        if relevantChangeDetected {
+            handler?()
         }
     }
 
@@ -67,7 +128,7 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
         }
     }
 
-    func thumbnail(assetID: String, targetSize: CGSize) async throws -> NSImage {
+    func thumbnail(assetID: String, targetSize: CGSize, networkAccessAllowed: Bool) async throws -> NSImage {
         try requireAuthorization()
         guard let asset = fetchAsset(assetID) else { throw CleanerError.assetUnavailable(assetID) }
         return try await withCheckedThrowingContinuation { continuation in
@@ -75,7 +136,7 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
             options.deliveryMode = .highQualityFormat
             options.resizeMode = .exact
             options.version = .current
-            options.isNetworkAccessAllowed = true
+            options.isNetworkAccessAllowed = networkAccessAllowed
             options.progressHandler = { _, error, _, _ in
                 if let error { /* Completion reports the definitive result. */ _ = error }
             }
@@ -86,6 +147,33 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
                     continuation.resume(throwing: error)
                 } else if let image {
                     continuation.resume(returning: image)
+                } else {
+                    continuation.resume(throwing: CleanerError.assetUnavailable(assetID))
+                }
+            }
+        }
+    }
+
+    func videoPlayerItem(assetID: String) async throws -> AVPlayerItem {
+        try requireAuthorization()
+        guard let asset = fetchAsset(assetID), asset.mediaType == .video else {
+            throw CleanerError.assetUnavailable(assetID)
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            let options = PHVideoRequestOptions()
+            options.deliveryMode = .highQualityFormat
+            options.version = .current
+            options.isNetworkAccessAllowed = true
+            options.progressHandler = { _, error, _, _ in
+                if let error { /* Completion reports the definitive result. */ _ = error }
+            }
+            imageManager.requestPlayerItem(forVideo: asset, options: options) { item, info in
+                if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled {
+                    continuation.resume(throwing: CleanerError.cancelled)
+                } else if let error = info?[PHImageErrorKey] as? Error {
+                    continuation.resume(throwing: error)
+                } else if let item {
+                    continuation.resume(returning: item)
                 } else {
                     continuation.resume(throwing: CleanerError.assetUnavailable(assetID))
                 }
@@ -316,6 +404,24 @@ final class PhotoKitLibraryClient: PhotoLibraryClient, ResourceLoader, CleanupAp
             }
         }
         return membership
+    }
+
+    private func assetFetchResults(for scope: ScanScope) -> [PHFetchResult<PHAsset>] {
+        let options = PHFetchOptions()
+        options.includeAssetSourceTypes = [.typeUserLibrary]
+        if scope.kind == .entireLibrary {
+            return [PHAsset.fetchAssets(with: options)]
+        }
+
+        let collections = PHAssetCollection.fetchAssetCollections(
+            withLocalIdentifiers: Array(scope.albumIDs),
+            options: nil
+        )
+        var results: [PHFetchResult<PHAsset>] = []
+        collections.enumerateObjects { collection, _, _ in
+            results.append(PHAsset.fetchAssets(in: collection, options: options))
+        }
+        return results
     }
 
     private func fetchAsset(_ id: String) -> PHAsset? {

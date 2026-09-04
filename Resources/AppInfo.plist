@@ -7,7 +7,9 @@
     <key>CFBundleExecutable</key>
     <string>PhotoDuplicateCleaner</string>
     <key>CFBundleIdentifier</key>
-    <string>local.anthonyflores.PhotoDuplicateCleaner</string>
+    <string>app.photoduplicatecleaner.mac</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -15,9 +17,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3</string>
+    <string>1.5</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>6</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSApplicationCategoryType</key>
@@ -27,6 +29,6 @@
     <key>NSPhotoLibraryUsageDescription</key>
     <string>Photo Duplicate Cleaner compares media, preserves selected metadata, and moves only approved duplicate copies to Recently Deleted.</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Local personal utility</string>
+    <string>Copyright © 2026 Photo Duplicate Cleaner contributors</string>
 </dict>
 </plist>

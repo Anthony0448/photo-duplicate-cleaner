@@ -1,5 +1,79 @@
 import AppKit
+import AVFoundation
+import AVKit
 import SwiftUI
+
+private enum CleanerStyle {
+    static let accent = Color(red: 0.30, green: 0.47, blue: 1.0)
+    static let mint = Color(red: 0.25, green: 0.88, blue: 0.76)
+    static let panelRadius: CGFloat = 22
+}
+
+private struct AmbientBackdrop: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            RadialGradient(
+                colors: [CleanerStyle.accent.opacity(colorScheme == .dark ? 0.18 : 0.12), .clear],
+                center: .topTrailing,
+                startRadius: 10,
+                endRadius: 620
+            )
+            RadialGradient(
+                colors: [CleanerStyle.mint.opacity(colorScheme == .dark ? 0.09 : 0.07), .clear],
+                center: .bottomLeading,
+                startRadius: 20,
+                endRadius: 520
+            )
+        }
+        .ignoresSafeArea()
+    }
+}
+
+private struct LiquidGlassSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    let tint: Color
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(
+                    .regular.tint(tint),
+                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                )
+        } else {
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .stroke(.white.opacity(0.16), lineWidth: 0.8)
+                }
+                .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
+        }
+    }
+}
+
+private extension View {
+    func liquidGlassSurface(
+        cornerRadius: CGFloat = CleanerStyle.panelRadius,
+        tint: Color = CleanerStyle.accent.opacity(0.06)
+    ) -> some View {
+        modifier(LiquidGlassSurface(cornerRadius: cornerRadius, tint: tint))
+    }
+}
+
+private func formattedDuration(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds > 0 else { return "Unknown duration" }
+    let totalSeconds = Int(seconds.rounded())
+    let hours = totalSeconds / 3_600
+    let minutes = (totalSeconds % 3_600) / 60
+    let remainingSeconds = totalSeconds % 60
+    if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds) }
+    return String(format: "%d:%02d", minutes, remainingSeconds)
+}
 
 struct CleanerRootView: View {
     @StateObject private var model = CleanerAppModel()
@@ -7,11 +81,15 @@ struct CleanerRootView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 270, ideal: 320)
+                .navigationSplitViewColumnWidth(min: 290, ideal: 330, max: 390)
         } detail: {
-            detail
+            ZStack {
+                AmbientBackdrop()
+                detail
+            }
         }
-        .frame(minWidth: 1050, minHeight: 700)
+        .tint(CleanerStyle.accent)
+        .frame(minWidth: 1120, minHeight: 740)
         .toolbar { toolbar }
         .sheet(isPresented: $model.showingConfirmation) { BatchConfirmationView(model: model) }
         .alert("Run a new comparison scan?", isPresented: $model.showingRescanConfirmation) {
@@ -19,6 +97,12 @@ struct CleanerRootView: View {
             Button("Rescan") { model.confirmRescan() }
         } message: {
             Text("The remembered results remain available if the rescan is cancelled or fails. A completed rescan will replace them using the currently selected scope.")
+        }
+        .alert("Photos Library Changed", isPresented: $model.showingLibraryChangeRescanPrompt) {
+            Button("Later", role: .cancel) { model.deferLibraryChangeRescan() }
+            Button("Rescan Now") { model.rescanAfterLibraryChange() }
+        } message: {
+            Text(model.libraryChangePromptMessage)
         }
         .alert("Photo Duplicate Cleaner", isPresented: errorBinding) {
             Button("OK") { model.dismissError() }
@@ -31,7 +115,6 @@ struct CleanerRootView: View {
     private var sidebar: some View {
         VStack(spacing: 0) {
             ScopeView(model: model)
-            Divider()
             if model.proposals.isEmpty {
                 ContentUnavailableView(
                     model.state == .scanning ? "Scanning Photos" : "No Review Groups",
@@ -51,8 +134,11 @@ struct CleanerRootView: View {
                         }
                     }
                 }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
             }
         }
+        .background(.thinMaterial)
     }
 
     @ViewBuilder private var detail: some View {
@@ -76,8 +162,8 @@ struct CleanerRootView: View {
             }
             Button("Export Journal", systemImage: "square.and.arrow.up") { model.exportJournal() }
                 .disabled(model.journalEntries.isEmpty)
-            Button("Review Batch (\(model.approvedProposals.count))", systemImage: "checklist") { model.showingConfirmation = true }
-                .disabled(model.approvedProposals.isEmpty || model.state == .applying)
+            Button("Review Cleanup (\(model.approvedProposals.count))", systemImage: "photo.badge.checkmark") { model.showingConfirmation = true }
+                .disabled(model.approvedProposals.isEmpty || model.state == .applying || model.libraryResultsAreStale)
         }
     }
 
@@ -102,9 +188,24 @@ private struct ScopeView: View {
     @ObservedObject var model: CleanerAppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Scan scope").font(.headline)
-            Picker("Scope", selection: $model.scope.kind) {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 11) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(CleanerStyle.accent.gradient)
+                    Image(systemName: "photo.stack.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 38, height: 38)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Duplicate Cleaner").font(.headline)
+                    Text("Private & on-device").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Picker("Library scope", selection: $model.scope.kind) {
                 ForEach(ScanScope.Kind.allCases) { kind in Text(kind.label).tag(kind) }
             }
             .pickerStyle(.segmented)
@@ -125,16 +226,46 @@ private struct ScopeView: View {
                 }.frame(maxHeight: 180)
             }
             if !model.proposals.isEmpty {
-                Button("Add safe exact groups to batch") { model.approveAllConflictFreeExact() }
-                    .font(.caption)
+                HStack(spacing: 10) {
+                    StatChip(value: model.exactCount, label: "Exact", color: CleanerStyle.mint)
+                    StatChip(value: model.likelyCount, label: "Visual", color: .orange)
+                }
+                Button("Add safe exact groups", systemImage: "checkmark.seal") { model.approveAllConflictFreeExact() }
+                    .controlSize(.small)
             }
             if let date = model.lastScanDate {
-                Label("Remembered: \(date.formatted(date: .abbreviated, time: .shortened))", systemImage: "clock")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Label("Saved \(date.formatted(date: .abbreviated, time: .shortened))", systemImage: "clock.arrow.circlepath")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if model.libraryResultsAreStale {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Photos changed — rescan recommended", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                    Button("Rescan Now") { model.rescanAfterLibraryChange() }
+                        .controlSize(.small)
+                }
             }
         }
-        .padding()
+        .padding(18)
         .disabled(model.state == .scanning)
+    }
+}
+
+private struct StatChip: View {
+    let value: Int
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(value, format: .number).fontWeight(.bold).monospacedDigit()
+            Text(label).foregroundStyle(.secondary)
+        }
+        .font(.caption)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(color.opacity(0.12), in: Capsule())
     }
 }
 
@@ -142,17 +273,50 @@ private struct WelcomeView: View {
     @ObservedObject var model: CleanerAppModel
 
     var body: some View {
-        ContentUnavailableView {
-            Label("Clean duplicates safely", systemImage: "photo.on.rectangle.angled")
-        } description: {
-            if let date = model.lastScanDate {
-                Text("The remembered scan from \(date.formatted(date: .abbreviated, time: .shortened)) has no remaining groups. Run a manual rescan whenever you want to compare the selected scope again.")
-            } else {
-                Text("The scan is local. Nothing changes in Photos until you choose keepers, resolve conflicts, and confirm a batch.")
+        VStack(spacing: 22) {
+            ZStack {
+                Circle().fill(CleanerStyle.accent.opacity(0.14))
+                Image(systemName: model.hasSavedScan ? "checkmark.seal.fill" : "photo.on.rectangle.angled")
+                    .font(.system(size: 44, weight: .medium))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(model.hasSavedScan ? CleanerStyle.mint : CleanerStyle.accent)
             }
-        } actions: {
-            Button(model.hasSavedScan ? "Manual Rescan" : "Start Scan") { model.requestScan() }.buttonStyle(.borderedProminent)
+            .frame(width: 92, height: 92)
+
+            VStack(spacing: 8) {
+                Text(model.hasSavedScan ? "Your library is tidy" : "Find duplicates, keep the best")
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                Text(welcomeDescription)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+                    .lineSpacing(3)
+            }
+
+            Button(model.hasSavedScan ? "Scan Again" : "Scan Photo Library", systemImage: "sparkles") {
+                model.requestScan()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            HStack(spacing: 20) {
+                Label("On-device", systemImage: "lock.shield")
+                Label("Review first", systemImage: "eye")
+                Label("Recently Deleted", systemImage: "arrow.uturn.backward.circle")
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
         }
+        .padding(44)
+        .liquidGlassSurface(cornerRadius: 32)
+        .padding(48)
+    }
+
+    private var welcomeDescription: String {
+        if let date = model.lastScanDate {
+            return "No review groups remain from the scan saved \(date.formatted(date: .abbreviated, time: .shortened)). Scan again whenever you’re ready."
+        }
+        return "Compare your Photos library locally, choose every keeper, and confirm changes before a single duplicate moves to Recently Deleted."
     }
 }
 
@@ -162,12 +326,15 @@ private struct ScanProgressView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: paused ? "pause.circle" : "photo.stack").font(.system(size: 54)).foregroundStyle(.tint)
-            Text(paused ? "Scan paused" : progress.phase.rawValue).font(.title2.bold())
-            ProgressView(value: progress.fraction).frame(width: 380)
-            Text("\(progress.completed) of \(progress.total)").monospacedDigit()
+            Image(systemName: paused ? "pause.circle.fill" : "photo.stack.fill")
+                .font(.system(size: 52)).symbolRenderingMode(.hierarchical).foregroundStyle(CleanerStyle.accent)
+            Text(paused ? "Scan paused" : progress.phase.rawValue).font(.title.bold())
+            ProgressView(value: progress.fraction).frame(width: 420).controlSize(.large)
+            Text("\(progress.completed) of \(progress.total)").font(.headline).monospacedDigit()
             Text(progress.detail).foregroundStyle(.secondary).lineLimit(1)
         }
+        .padding(38)
+        .liquidGlassSurface(cornerRadius: 28)
     }
 }
 
@@ -175,15 +342,17 @@ private struct ProposalRow: View {
     let proposal: MergeProposal
 
     var body: some View {
-        HStack {
+        HStack(spacing: 11) {
             Image(systemName: statusIcon)
                 .foregroundStyle(statusColor)
+                .font(.system(size: 16, weight: .semibold))
             VStack(alignment: .leading) {
-                Text(proposal.keeper.originalFilename).lineLimit(1)
+                Text(proposal.keeper.originalFilename).fontWeight(.medium).lineLimit(1)
                 Text(statusText)
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+        .padding(.vertical, 5)
     }
 
     private var statusIcon: String {
@@ -210,6 +379,7 @@ private struct ProposalRow: View {
 private struct ProposalDetailView: View {
     @ObservedObject var model: CleanerAppModel
     let proposal: MergeProposal
+    @State private var previewedAsset: AssetSnapshot?
 
     private var assets: [AssetSnapshot] { [proposal.keeper] + proposal.donors }
 
@@ -217,20 +387,25 @@ private struct ProposalDetailView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 16) {
                         HStack {
-                            VStack(alignment: .leading) {
-                                Text(proposal.confidence.label).font(.title2.bold())
-                                Text("Review this group before anything is changed in Photos.").foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(proposal.confidence.label)
+                                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                                Text("Compare every copy, then choose what stays.").foregroundStyle(.secondary)
                             }
                             Spacer()
                             if proposal.isApproved {
                                 Label("In Cleanup Batch", systemImage: "checkmark.circle.fill")
-                                    .font(.headline).foregroundStyle(.green)
+                                    .font(.headline).foregroundStyle(CleanerStyle.mint)
+                                    .padding(.horizontal, 12).padding(.vertical, 7)
+                                    .background(CleanerStyle.mint.opacity(0.12), in: Capsule())
                             }
                         }
                         ReviewSteps(proposal: proposal)
                     }
+                    .padding(20)
+                    .liquidGlassSurface()
 
                     ScrollView(.horizontal) {
                         HStack(alignment: .top, spacing: 14) {
@@ -240,6 +415,8 @@ private struct ProposalDetailView: View {
                                     asset: asset,
                                     isKeeper: asset.id == proposal.keeper.id,
                                     willDelete: proposal.donorIDsToDelete.contains(asset.id),
+                                    locationNeedsAttention: Set(assets.map { $0.location != nil }).count > 1,
+                                    quickLook: { previewedAsset = asset },
                                     chooseKeeper: { model.chooseKeeper(proposalID: proposal.id, assetID: asset.id) },
                                     toggleDeletion: { model.toggleDeletion(proposalID: proposal.id, assetID: asset.id) }
                                 )
@@ -248,7 +425,7 @@ private struct ProposalDetailView: View {
                     }
 
                     if !proposal.conflicts.isEmpty {
-                        GroupBox("Step 3: Choose metadata to preserve") {
+                        GroupBox("Choose metadata to preserve") {
                             VStack(alignment: .leading, spacing: 14) {
                                 ForEach(proposal.conflicts) { conflict in
                                     VStack(alignment: .leading, spacing: 7) {
@@ -271,6 +448,7 @@ private struct ProposalDetailView: View {
                                 }
                             }.frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .groupBoxStyle(GlassGroupBoxStyle(icon: "slider.horizontal.3", tint: .orange))
                     }
 
                     GroupBox("What will happen") {
@@ -286,16 +464,19 @@ private struct ProposalDetailView: View {
                             MetadataGridRow(label: "Albums added", value: proposal.albumsToAdd.isEmpty ? "None" : proposal.albumsToAdd.map(\.title).joined(separator: ", "))
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .groupBoxStyle(GlassGroupBoxStyle(icon: "arrow.right.circle", tint: CleanerStyle.accent))
 
                     if proposal.confidence == .likelyVisual {
                         Label("This is a visual match. All non-keepers are initially marked DELETE; use Undo Delete on any copy you want to retain.", systemImage: "eye.trianglebadge.exclamationmark")
                             .foregroundStyle(.orange)
                     }
                 }
-                .padding(24)
+                .padding(26)
             }
-            Divider()
             reviewActions
+        }
+        .sheet(item: $previewedAsset) { asset in
+            MediaQuickLookView(library: model.library, asset: asset)
         }
     }
 
@@ -323,7 +504,9 @@ private struct ProposalDetailView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
-        .background(.bar)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) { Divider().opacity(0.6) }
+        .shadow(color: .black.opacity(0.08), radius: 16, y: -4)
     }
 
     private func conflictValue(_ field: MetadataField, asset: AssetSnapshot) -> String {
@@ -341,6 +524,26 @@ private struct ProposalDetailView: View {
             parts.append(asset.contentType)
             return parts.joined(separator: " • ")
         }
+    }
+}
+
+private struct GlassGroupBoxStyle: GroupBoxStyle {
+    let icon: String
+    let tint: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 9) {
+                Image(systemName: icon)
+                    .foregroundStyle(tint)
+                    .frame(width: 24, height: 24)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                configuration.label.font(.headline)
+            }
+            configuration.content
+        }
+        .padding(18)
+        .liquidGlassSurface(tint: tint.opacity(0.04))
     }
 }
 
@@ -386,13 +589,16 @@ private struct MetadataChoiceCard: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
-            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.22)))
+            .liquidGlassSurface(cornerRadius: 13, tint: isKeeper ? CleanerStyle.mint.opacity(0.08) : CleanerStyle.accent.opacity(0.05))
         }
         .buttonStyle(.plain)
         .help("Keep this metadata value")
         .task {
-            image = try? await library.thumbnail(assetID: asset.id, targetSize: .init(width: 116, height: 116))
+            image = try? await library.thumbnail(
+                assetID: asset.id,
+                targetSize: .init(width: 116, height: 116),
+                networkAccessAllowed: false
+            )
         }
     }
 
@@ -410,6 +616,7 @@ private struct ReviewSteps: View {
             StepPill(number: 3, text: proposal.conflicts.isEmpty ? "Metadata ready" : "Resolve metadata", complete: proposal.conflicts.isEmpty)
         }
         .font(.caption.weight(.medium))
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -425,7 +632,7 @@ private struct StepPill: View {
         }
         .foregroundStyle(complete ? Color.green : Color.gray)
         .padding(.horizontal, 10).padding(.vertical, 6)
-        .background((complete ? Color.green : Color.gray).opacity(0.1), in: Capsule())
+        .background((complete ? CleanerStyle.mint : Color.gray).opacity(0.11), in: Capsule())
     }
 }
 
@@ -434,35 +641,66 @@ private struct AssetCard: View {
     let asset: AssetSnapshot
     let isKeeper: Bool
     let willDelete: Bool
+    let locationNeedsAttention: Bool
+    let quickLook: () -> Void
     let chooseKeeper: () -> Void
     let toggleDeletion: () -> Void
     @State private var image: NSImage?
+    @State private var thumbnailUnavailable = false
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(.quaternary)
-                if let image { Image(nsImage: image).resizable().scaledToFit() }
-                else { ProgressView() }
+                RoundedRectangle(cornerRadius: 15, style: .continuous).fill(.quaternary)
+                if let image {
+                    Image(nsImage: image).resizable().scaledToFit()
+                } else if thumbnailUnavailable {
+                    VStack(spacing: 7) {
+                        Image(systemName: "icloud.and.arrow.down")
+                            .font(.title2)
+                        Text("Open preview to load")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                }
                 VStack {
                     HStack {
                         Spacer()
                         Text(isKeeper ? "KEEPER" : (willDelete ? "DELETE" : "KEEP"))
-                            .font(.caption.bold())
+                            .font(.caption2.bold())
                             .padding(.horizontal, 9).padding(.vertical, 5)
-                            .background(isKeeper ? Color.green : (willDelete ? Color.red : Color.secondary), in: Capsule())
+                            .background(isKeeper ? CleanerStyle.mint : (willDelete ? Color.red : Color.secondary), in: Capsule())
                             .foregroundStyle(.white)
                     }
                     Spacer()
                 }.padding(8)
+                VStack {
+                    Spacer()
+                    HStack {
+                        Button(action: quickLook) {
+                            Label(asset.mediaKind == .video ? "Play Video" : "Quick Look", systemImage: asset.mediaKind == .video ? "play.fill" : "eye.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.black.opacity(0.68))
+                        .controlSize(.small)
+                        Spacer()
+                    }
+                }
+                .padding(9)
             }
-            .frame(width: 280, height: 220)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .frame(width: 292, height: 226)
+            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
             .contentShape(Rectangle())
-            .onTapGesture { if !isKeeper { chooseKeeper() } }
+            .onTapGesture {
+                isFocused = true
+                quickLook()
+            }
             if isKeeper {
                 Label("Selected keeper", systemImage: "checkmark.circle.fill")
-                    .font(.headline).foregroundStyle(.green)
+                    .font(.headline).foregroundStyle(CleanerStyle.mint)
             } else {
                 HStack {
                     Button("Make Keeper", action: chooseKeeper).buttonStyle(.bordered)
@@ -474,23 +712,219 @@ private struct AssetCard: View {
                     }
                 }
             }
-            Text(asset.originalFilename).font(.headline).lineLimit(1)
+            Text(asset.originalFilename).font(.headline).lineLimit(1).truncationMode(.middle)
             Text("\(asset.pixelWidth) × \(asset.pixelHeight) • \(ByteCountFormatter.string(fromByteCount: asset.totalKnownBytes, countStyle: .file))")
                 .font(.caption).foregroundStyle(.secondary)
+            if asset.mediaKind == .video {
+                Label(formattedDuration(asset.duration), systemImage: "timer")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(CleanerStyle.accent)
+            }
             Text(asset.creationDate?.formatted(date: .abbreviated, time: .standard) ?? "No capture date").font(.caption)
-            Text(asset.location == nil ? "No location" : "Has location").font(.caption)
+            locationLabel
             HStack {
                 if asset.isLivePhoto { Label("Live", systemImage: "livephoto") }
                 if asset.isRAW { Text("RAW") }
                 if asset.hasAdjustments { Label("Edited", systemImage: "slider.horizontal.3") }
             }.font(.caption2).foregroundStyle(.secondary)
         }
-        .padding(10)
-        .background(isKeeper ? Color.green.opacity(0.10) : (willDelete ? Color.red.opacity(0.08) : Color.clear), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(isKeeper ? Color.green : (willDelete ? Color.red : Color.secondary.opacity(0.25)), lineWidth: isKeeper || willDelete ? 2 : 1))
-        .task {
-            image = try? await library.thumbnail(assetID: asset.id, targetSize: .init(width: 520, height: 400))
+        .padding(12)
+        .liquidGlassSurface(
+            cornerRadius: 20,
+            tint: isKeeper ? CleanerStyle.mint.opacity(0.12) : (willDelete ? Color.red.opacity(0.08) : CleanerStyle.accent.opacity(0.04))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(isKeeper ? CleanerStyle.mint : (willDelete ? Color.red : Color.clear), lineWidth: 1.5)
         }
+        .focusable()
+        .focused($isFocused)
+        .onKeyPress(.space) {
+            quickLook()
+            return .handled
+        }
+        .help("Click the media or focus this card and press Space to preview it")
+        .task {
+            do {
+                image = try await library.thumbnail(
+                    assetID: asset.id,
+                    targetSize: .init(width: 520, height: 400),
+                    networkAccessAllowed: false
+                )
+            } catch {
+                thumbnailUnavailable = true
+            }
+        }
+    }
+
+    @ViewBuilder private var locationLabel: some View {
+        if let location = asset.location {
+            Label(String(format: "%.4f, %.4f", location.latitude, location.longitude), systemImage: "location.fill")
+                .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
+                .font(.caption)
+                .fontWeight(locationNeedsAttention ? .semibold : .regular)
+        } else {
+            Label(locationNeedsAttention ? "Location missing — compare carefully" : "No location", systemImage: "location.slash")
+                .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
+                .font(.caption)
+                .fontWeight(locationNeedsAttention ? .semibold : .regular)
+        }
+    }
+}
+
+private struct MediaQuickLookView: View {
+    let library: PhotoLibraryClient
+    let asset: AssetSnapshot
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: NSImage?
+    @State private var player: AVPlayer?
+    @State private var errorMessage: String?
+    @State private var isLoading = true
+    @State private var needsPhotoAccess = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: asset.mediaKind == .video ? "video.fill" : "photo.fill")
+                    .foregroundStyle(CleanerStyle.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(asset.originalFilename)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(detailText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+
+            Divider()
+
+            ZStack {
+                Color.black.opacity(0.94)
+                if needsPhotoAccess {
+                    ContentUnavailableView {
+                        Label("Photos Access Needed", systemImage: "photo.badge.exclamationmark")
+                    } description: {
+                        Text("PhotoKit needs full Photos access to open this selected library item.")
+                    } actions: {
+                        HStack {
+                            Button("Open Privacy Settings") { openPhotosPrivacySettings() }
+                            Button("Try Again") { Task { await loadPreview() } }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    .foregroundStyle(.white)
+                } else if let errorMessage {
+                    ContentUnavailableView(
+                        "Preview Unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(errorMessage)
+                    )
+                    .foregroundStyle(.white)
+                } else if asset.mediaKind == .video, let player {
+                    NativeVideoPlayer(player: player)
+                        .padding(18)
+                } else if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .padding(18)
+                } else if isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text(asset.mediaKind == .video ? "Loading video…" : "Loading photo…")
+                            .foregroundStyle(.white.opacity(0.72))
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 820, idealWidth: 1_020, minHeight: 600, idealHeight: 760)
+        .task(id: asset.id) { await loadPreview() }
+        .onDisappear {
+            player?.pause()
+            player = nil
+        }
+        .onExitCommand { dismiss() }
+    }
+
+    private var detailText: String {
+        var details = ["\(asset.pixelWidth) × \(asset.pixelHeight)"]
+        if asset.mediaKind == .video { details.append(formattedDuration(asset.duration)) }
+        if asset.isLivePhoto { details.append("Live Photo") }
+        if asset.isRAW { details.append("RAW") }
+        return details.joined(separator: " • ")
+    }
+
+    @MainActor
+    private func loadPreview() async {
+        isLoading = true
+        errorMessage = nil
+        needsPhotoAccess = false
+        do {
+            var access = library.authorizationStatus()
+            if access == .notDetermined {
+                access = await library.requestAuthorization()
+            }
+            guard access == .authorized else {
+                needsPhotoAccess = true
+                throw access == .limited
+                    ? CleanerError.limitedAccessUnsupported
+                    : CleanerError.photoAccessRequired
+            }
+            if asset.mediaKind == .video {
+                let item = try await library.videoPlayerItem(assetID: asset.id)
+                try Task.checkCancellation()
+                let loadedPlayer = AVPlayer(playerItem: item)
+                player = loadedPlayer
+                loadedPlayer.play()
+            } else {
+                image = try await library.thumbnail(
+                    assetID: asset.id,
+                    targetSize: .init(width: 2_400, height: 1_800),
+                    networkAccessAllowed: true
+                )
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func openPhotosPrivacySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") else { return }
+        NSWorkspace.shared.open(url)
+    }
+}
+
+private struct NativeVideoPlayer: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let playerView = AVPlayerView()
+        playerView.controlsStyle = .floating
+        playerView.showsFullScreenToggleButton = true
+        playerView.player = player
+        return playerView
+    }
+
+    func updateNSView(_ playerView: AVPlayerView, context: Context) {
+        if playerView.player !== player {
+            playerView.player = player
+        }
+    }
+
+    static func dismantleNSView(_ playerView: AVPlayerView, coordinator: Void) {
+        playerView.player?.pause()
+        playerView.player = nil
     }
 }
 
@@ -498,7 +932,163 @@ private struct MetadataGridRow: View {
     let label: String
     let value: String
     var body: some View {
-        GridRow { Text(label).foregroundStyle(.secondary); Text(value).textSelection(.enabled) }
+        GridRow {
+            Text(label).font(.callout.weight(.medium)).foregroundStyle(.secondary)
+            Text(value).textSelection(.enabled)
+        }
+    }
+}
+
+private struct BatchAssetPreview: View {
+    let library: PhotoLibraryClient
+    let asset: AssetSnapshot
+    let isKeeper: Bool
+    let locationNeedsAttention: Bool
+    @State private var image: NSImage?
+
+    private var roleColor: Color { isKeeper ? CleanerStyle.mint : .red }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous).fill(.quaternary)
+                if let image {
+                    Image(nsImage: image).resizable().scaledToFill()
+                } else {
+                    ProgressView()
+                }
+                if asset.mediaKind == .video {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.white, .black.opacity(0.35))
+                        .shadow(radius: 3)
+                }
+                VStack {
+                    HStack {
+                        Text(isKeeper ? "KEEP" : "MOVE TO RECENTLY DELETED")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(roleColor, in: Capsule())
+                            .foregroundStyle(.white)
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(8)
+            }
+            .frame(width: 220, height: 128)
+            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+
+            Text(asset.originalFilename)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            HStack(spacing: 8) {
+                Label("\(asset.pixelWidth) × \(asset.pixelHeight)", systemImage: "aspectratio")
+                if asset.mediaKind == .video {
+                    Label(formattedDuration(asset.duration), systemImage: "timer")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Label(asset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "No capture date", systemImage: "calendar")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let location = asset.location {
+                Label(String(format: "%.4f, %.4f", location.latitude, location.longitude), systemImage: "location.fill")
+                    .font(.caption.weight(locationNeedsAttention ? .semibold : .regular))
+                    .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
+            } else {
+                Label(locationNeedsAttention ? "Location missing" : "No location", systemImage: "location.slash")
+                    .font(.caption.weight(locationNeedsAttention ? .semibold : .regular))
+                    .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
+            }
+        }
+        .frame(width: 220, alignment: .leading)
+        .padding(12)
+        .background(roleColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
+                .stroke(roleColor.opacity(0.5), lineWidth: 1)
+        }
+        .task {
+            image = try? await library.thumbnail(
+                assetID: asset.id,
+                targetSize: .init(width: 440, height: 256),
+                networkAccessAllowed: false
+            )
+        }
+    }
+}
+
+private struct BatchProposalCard: View {
+    let library: PhotoLibraryClient
+    let proposal: MergeProposal
+
+    private var displayedAssets: [AssetSnapshot] { [proposal.keeper] + proposal.selectedDonors }
+    private var locationNeedsAttention: Bool {
+        Set(displayedAssets.map { $0.location != nil }).count > 1
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label(proposal.confidence.label, systemImage: proposal.keeper.mediaKind == .video ? "video.fill" : "photo.fill")
+                    .font(.headline)
+                Spacer()
+                Text("1 kept • \(proposal.selectedDonors.count) deleted")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(alignment: .center, spacing: 14) {
+                BatchAssetPreview(
+                    library: library,
+                    asset: proposal.keeper,
+                    isKeeper: true,
+                    locationNeedsAttention: locationNeedsAttention
+                )
+
+                Image(systemName: "arrow.right")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(proposal.selectedDonors) { asset in
+                            BatchAssetPreview(
+                                library: library,
+                                asset: asset,
+                                isKeeper: false,
+                                locationNeedsAttention: locationNeedsAttention
+                            )
+                        }
+                    }
+                }
+                .scrollIndicators(.visible)
+            }
+
+            if locationNeedsAttention {
+                Label("Final keeper location: \(finalLocationText)", systemImage: "location.fill.viewfinder")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+            if !proposal.retainedCandidates.isEmpty {
+                Label("\(proposal.retainedCandidates.count) additional cop\(proposal.retainedCandidates.count == 1 ? "y is" : "ies are") staying in Photos.", systemImage: "photo.on.rectangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .liquidGlassSurface(cornerRadius: 20)
+    }
+
+    private var finalLocationText: String {
+        guard let location = proposal.proposedLocation else { return "No location" }
+        return String(format: "%.4f, %.4f", location.latitude, location.longitude)
     }
 }
 
@@ -506,29 +1096,52 @@ private struct BatchConfirmationView: View {
     @ObservedObject var model: CleanerAppModel
     @Environment(\.dismiss) private var dismiss
 
+    private var deletionCount: Int { model.approvedProposals.flatMap(\.selectedDonors).count }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Confirm cleanup batch").font(.title.bold())
-            Text("\(model.approvedProposals.count) groups will keep the selected media and move \(model.approvedProposals.flatMap(\.selectedDonors).count) explicitly selected copies to Recently Deleted.")
-            List(model.approvedProposals) { proposal in
-                VStack(alignment: .leading) {
-                    Text("Keep \(proposal.keeper.originalFilename)").font(.headline)
-                    Text("Delete: \(proposal.selectedDonors.map(\.originalFilename).joined(separator: ", "))").font(.caption).foregroundStyle(.red)
-                    if !proposal.retainedCandidates.isEmpty {
-                        Text("Also keep: \(proposal.retainedCandidates.map(\.originalFilename).joined(separator: ", "))").font(.caption).foregroundStyle(.secondary)
+        ZStack {
+            AmbientBackdrop()
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 14) {
+                    Image(systemName: "photo.badge.checkmark")
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(CleanerStyle.accent)
+                        .frame(width: 56, height: 56)
+                        .background(CleanerStyle.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Confirm photo & video cleanup").font(.title.bold())
+                        Text("See exactly what stays and what moves to Recently Deleted.").foregroundStyle(.secondary)
                     }
                 }
+
+                HStack(spacing: 16) {
+                    Label("\(model.approvedProposals.count) groups", systemImage: "square.stack.3d.up")
+                    Label("\(deletionCount) duplicates", systemImage: "trash")
+                }
+                .font(.headline)
+
+                ScrollView {
+                    LazyVStack(spacing: 14) {
+                        ForEach(model.approvedProposals) { proposal in
+                            BatchProposalCard(library: model.library, proposal: proposal)
+                        }
+                    }
+                    .padding(2)
+                }
+
+                Label("Photos keeps deleted items temporarily. The journal can restore metadata, but not media after permanent deletion.", systemImage: "clock.arrow.circlepath")
+                    .foregroundStyle(.orange)
+                    .font(.callout)
+                HStack {
+                    Spacer()
+                    Button("Cancel") { dismiss() }
+                    Button("Move \(deletionCount) Duplicates to Recently Deleted", role: .destructive) { model.applyApproved() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                }
             }
-            Label("Photos retains deleted items for a limited recovery period. The journal cannot restore media after Photos permanently deletes it.", systemImage: "clock.arrow.circlepath")
-                .foregroundStyle(.orange)
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Update Keepers & Move Duplicates", role: .destructive) { model.applyApproved() }
-                    .buttonStyle(.borderedProminent)
-            }
+            .padding(26)
         }
-        .padding(24)
-        .frame(width: 680, height: 520)
+        .frame(width: 960, height: 720)
     }
 }

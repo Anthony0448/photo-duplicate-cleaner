@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum MediaKind: String, Codable, CaseIterable, Sendable {
     case image
@@ -70,7 +71,7 @@ struct ResourceManifest: Codable, Hashable, Identifiable, Sendable {
 }
 
 struct MediaFingerprint: Codable, Equatable, Sendable {
-    static let matcherVersion = 1
+    static let matcherVersion = 2
 
     var matcherVersion: Int = MediaFingerprint.matcherVersion
     var contentDigest: String?
@@ -282,6 +283,29 @@ struct SavedReviewSession: Codable, Sendable {
     var lastScanDate: Date
     var scope: ScanScope
     var proposals: [MergeProposal]
+    var libraryRevision: String? = nil
+}
+
+enum LibraryRevision {
+    static func signature(for assets: [AssetSnapshot]) -> String {
+        var normalized = assets.sorted { $0.id < $1.id }
+        for index in normalized.indices {
+            normalized[index].fingerprint = nil
+            normalized[index].keywords.sort()
+            normalized[index].albums.sort { $0.id < $1.id }
+            normalized[index].resources.sort { $0.key < $1.key }
+            for resourceIndex in normalized[index].resources.indices {
+                normalized[index].resources[resourceIndex].sha256 = nil
+                normalized[index].resources[resourceIndex].byteCount = nil
+            }
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let data = (try? encoder.encode(normalized)) ?? Data()
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 struct ScanProgress: Equatable, Sendable {
