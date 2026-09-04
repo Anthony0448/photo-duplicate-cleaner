@@ -117,20 +117,26 @@ final class JSONJournalStore: JournalStore {
         let formatter = ISO8601DateFormatter()
         for entry in entries {
             let proposal = entry.proposal
-            rows.append([
+            let completedAt = entry.completedAt.map { formatter.string(from: $0) } ?? ""
+            let donorIDs = proposal.selectedDonors.map(\.id).joined(separator: "|")
+            let creationDate = proposal.proposedCreationDate.map { formatter.string(from: $0) } ?? ""
+            let latitude = proposal.proposedLocation.map { String($0.latitude) } ?? ""
+            let longitude = proposal.proposedLocation.map { String($0.longitude) } ?? ""
+            let columns: [String] = [
                 entry.id.uuidString,
                 entry.status.rawValue,
                 formatter.string(from: entry.createdAt),
-                entry.completedAt.map(formatter.string) ?? "",
+                completedAt,
                 proposal.confidence.rawValue,
                 proposal.keeper.id,
                 proposal.keeper.originalFilename,
-                proposal.selectedDonors.map(\.id).joined(separator: "|"),
-                proposal.proposedCreationDate.map(formatter.string) ?? "",
-                proposal.proposedLocation.map { String($0.latitude) } ?? "",
-                proposal.proposedLocation.map { String($0.longitude) } ?? "",
+                donorIDs,
+                creationDate,
+                latitude,
+                longitude,
                 entry.errorMessage ?? ""
-            ].map(Self.csvEscape).joined(separator: ","))
+            ]
+            rows.append(columns.map(Self.csvEscape).joined(separator: ","))
         }
         try rows.joined(separator: "\n").data(using: .utf8)!.write(to: csvURL, options: .atomic)
     }
