@@ -5,9 +5,17 @@ enum AppStoragePaths {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appendingPathComponent("PhotoDuplicateCleaner", isDirectory: true)
     }()
-    static let inventory = root.appendingPathComponent("inventory-v1.json")
+    static let fingerprints = root.appendingPathComponent("fingerprints-v2.jsonl")
     static let journal = root.appendingPathComponent("cleanup-journal-v1.json")
-    static let reviewSession = root.appendingPathComponent("review-session-v1.json")
+    static let reviewSession = root.appendingPathComponent("review-session-v2.json")
+
+    /// The v1 inventory held every snapshot in one file that could reach gigabytes on
+    /// a large library. Nothing reads it any more, so reclaim the space on launch.
+    static func removeSupersededFiles() {
+        for name in ["inventory-v1.json", "review-session-v1.json"] {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
+        }
+    }
 }
 
 final class JSONReviewSessionStore: ReviewSessionStore {
@@ -30,42 +38,6 @@ final class JSONReviewSessionStore: ReviewSessionStore {
     func clear() throws {
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         try FileManager.default.removeItem(at: url)
-    }
-
-    private static let encoder: JSONEncoder = {
-        let value = JSONEncoder()
-        value.dateEncodingStrategy = .iso8601
-        value.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return value
-    }()
-    private static let decoder: JSONDecoder = {
-        let value = JSONDecoder()
-        value.dateDecodingStrategy = .iso8601
-        return value
-    }()
-}
-
-final class JSONInventoryCache: InventoryCache {
-    private let url: URL
-    init(url: URL = AppStoragePaths.inventory) { self.url = url }
-
-    func load() throws -> [AssetSnapshot] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        return try Self.decoder.decode([AssetSnapshot].self, from: Data(contentsOf: url))
-    }
-
-    func save(_ assets: [AssetSnapshot]) throws {
-        try ensureParent()
-        try Self.encoder.encode(assets).write(to: url, options: .atomic)
-    }
-
-    func clear() throws {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try FileManager.default.removeItem(at: url)
-    }
-
-    private func ensureParent() throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     }
 
     private static let encoder: JSONEncoder = {

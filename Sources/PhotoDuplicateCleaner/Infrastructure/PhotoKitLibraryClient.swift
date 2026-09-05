@@ -6,7 +6,7 @@ import Foundation
 import Photos
 import UniformTypeIdentifiers
 
-final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader, CleanupApplier, PHPhotoLibraryChangeObserver {
+final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader, CleanupApplier, PHPhotoLibraryChangeObserver, @unchecked Sendable {
     private let library = PHPhotoLibrary.shared()
     private let imageManager = PHCachingImageManager()
     private let resourceManager = PHAssetResourceManager.default()
@@ -15,6 +15,8 @@ final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader,
     private var changeHandler: (@Sendable () -> Void)?
     private var isRegisteredForChanges = false
     private var observationGeneration = 0
+    private let membershipLock = NSLock()
+    private var cachedAlbumMembership: [String: [AlbumReference]]?
 
     override init() {
         super.init()
@@ -56,6 +58,10 @@ final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader,
     }
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
+        membershipLock.lock()
+        cachedAlbumMembership = nil
+        membershipLock.unlock()
+
         observationLock.lock()
         let fetchResults = observedAssetFetchResults
         let handler = changeHandler
@@ -86,46 +92,135 @@ final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader,
 
     func fetchAlbums() async throws -> [AlbumReference] {
         try requireAuthorization()
-        let result = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
-        var albums: [AlbumReference] = []
-        result.enumerateObjects { collection, _, _ in
-            guard collection.assetCollectionSubtype != .albumCloudShared else { return }
-            albums.append(.init(
-                id: collection.localIdentifier,
-                title: collection.localizedTitle ?? "Untitled album",
-                canAddContent: collection.canPerform(.addContent)
-            ))
-        }
-        return albums.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        return try albumReferences()
     }
 
-    func fetchAssets(scope: ScanScope) async throws -> [AssetSnapshot] {
+    func fetchAssetIdentifiers(scope: ScanScope) async throws -> [String] {
         try requireAuthorization()
-        let albums = try await fetchAlbums()
-        let membership = albumMembership(albums: albums)
-        let fetchOptions = PHFetchOptions()
-        fetchOptions.includeAssetSourceTypes = [.typeUserLibrary]
+        // Warmed here so the expensive snapshot pages that follow never rebuild it.
+        _ = try albumMembershipIndex()
+
+        var identifiers: [String] = []
+        var seen = Set<String>()
+        try enumerateScopedAssets(scope: scope, options: indexOnlyFetchOptions(scope: scope)) { asset in
+            guard seen.insert(asset.localIdentifier).inserted else { return }
+            identifiers.append(asset.localIdentifier)
+        }
+        return identifiers
+    }
+
+    func fetchSnapshots(ids: [String]) async throws -> [AssetSnapshot] {
+        try requireAuthorization()
+        guard !ids.isEmpty else { return [] }
+        let membership = try albumMembershipIndex()
+
+        let options = PHFetchOptions()
+        options.includeAssetSourceTypes = [.typeUserLibrary]
 #if PHOTO_EXTENDED_METADATA
-        if #available(macOS 27.0, *) { fetchOptions.prefetchAssetExtendedMetadata = true }
+        if #available(macOS 27.0, *) { options.prefetchAssetExtendedMetadata = true }
 #endif
 
-        var fetched: [PHAsset] = []
-        if scope.kind == .entireLibrary {
-            PHAsset.fetchAssets(with: fetchOptions).enumerateObjects { asset, _, _ in fetched.append(asset) }
-        } else {
-            var seen = Set<String>()
-            let selected = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: Array(scope.albumIDs), options: nil)
-            selected.enumerateObjects { collection, _, _ in
-                PHAsset.fetchAssets(in: collection, options: fetchOptions).enumerateObjects { asset, _, _ in
-                    if seen.insert(asset.localIdentifier).inserted { fetched.append(asset) }
-                }
+        var snapshots: [AssetSnapshot] = []
+        snapshots.reserveCapacity(ids.count)
+        var cancelled = false
+        PHAsset.fetchAssets(withLocalIdentifiers: ids, options: options).enumerateObjects { asset, _, stop in
+            if Task.isCancelled {
+                cancelled = true
+                stop.pointee = true
+                return
             }
+            guard Self.isScannable(asset) else { return }
+            snapshots.append(self.snapshot(asset: asset, albums: membership[asset.localIdentifier] ?? []))
+        }
+        if cancelled { throw CancellationError() }
+        return snapshots
+    }
+
+    func fetchMonthBuckets() async throws -> [MonthBucket] {
+        try requireAuthorization()
+        var captureDates: [Date?] = []
+        try enumerateScopedAssets(scope: ScanScope(), options: indexOnlyFetchOptions(scope: ScanScope())) { asset in
+            captureDates.append(asset.creationDate)
+        }
+        return MonthBucketing.buckets(forCaptureDates: captureDates)
+    }
+
+    func fetchRevisionTokens(scope: ScanScope) async throws -> [AssetRevisionToken] {
+        try requireAuthorization()
+        var tokens: [AssetRevisionToken] = []
+        var seen = Set<String>()
+        try enumerateScopedAssets(scope: scope, options: indexOnlyFetchOptions(scope: scope)) { asset in
+            guard seen.insert(asset.localIdentifier).inserted else { return }
+            tokens.append(.init(id: asset.localIdentifier, modificationDate: asset.modificationDate))
+        }
+        return tokens
+    }
+
+    /// Walks the assets a scope covers, reading only indexed properties. Extended
+    /// metadata and asset resources are deliberately untouched here: those are the
+    /// per-asset round trips that make a full inventory slow, and they belong in
+    /// `fetchSnapshots(ids:)` where the caller can page and report progress.
+    private func enumerateScopedAssets(
+        scope: ScanScope,
+        options: PHFetchOptions,
+        // `PHFetchResult` block parameters are nominally escaping, though enumeration
+        // is finished by the time this returns.
+        body: @escaping (PHAsset) -> Void
+    ) throws {
+        // The undated bucket is the one capture filter left out of the fetch predicate,
+        // so it has to be applied here instead. See `indexOnlyFetchOptions(scope:)`.
+        let keepOnlyUndated = scope.captureFilter == .undated
+        var cancelled = false
+        func consume(_ asset: PHAsset, _ stop: UnsafeMutablePointer<ObjCBool>) {
+            if Task.isCancelled {
+                cancelled = true
+                stop.pointee = true
+                return
+            }
+            guard Self.isScannable(asset) else { return }
+            guard !keepOnlyUndated || asset.creationDate == nil else { return }
+            body(asset)
         }
 
-        return fetched.compactMap { asset in
-            guard asset.sourceType.contains(.typeUserLibrary), asset.mediaType == .image || asset.mediaType == .video else { return nil }
-            return snapshot(asset: asset, albums: membership[asset.localIdentifier] ?? [])
+        if scope.kind == .selectedAlbums {
+            let selected = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: Array(scope.albumIDs), options: nil)
+            selected.enumerateObjects { collection, _, stop in
+                if cancelled {
+                    stop.pointee = true
+                    return
+                }
+                PHAsset.fetchAssets(in: collection, options: options).enumerateObjects { asset, _, innerStop in
+                    consume(asset, innerStop)
+                }
+                if cancelled { stop.pointee = true }
+            }
+        } else {
+            PHAsset.fetchAssets(with: options).enumerateObjects { asset, _, stop in consume(asset, stop) }
         }
+
+        if cancelled { throw CancellationError() }
+    }
+
+    private func indexOnlyFetchOptions(scope: ScanScope) -> PHFetchOptions {
+        let options = PHFetchOptions()
+        options.includeAssetSourceTypes = [.typeUserLibrary]
+        // A date range is one of the comparisons Photos can answer from its index, so a
+        // month batch really does fetch only that month. Photos does not document a nil
+        // test on creationDate, and an unsupported predicate raises instead of returning
+        // nothing, so undated assets are filtered during enumeration instead. That bucket
+        // is rare and small, which is the only reason walking the index for it is fine.
+        if case .window(let start, let end) = scope.captureFilter {
+            options.predicate = NSPredicate(
+                format: "creationDate >= %@ AND creationDate < %@",
+                start as NSDate,
+                end as NSDate
+            )
+        }
+        return options
+    }
+
+    private static func isScannable(_ asset: PHAsset) -> Bool {
+        asset.sourceType.contains(.typeUserLibrary) && (asset.mediaType == .image || asset.mediaType == .video)
     }
 
     func thumbnail(assetID: String, targetSize: CGSize, networkAccessAllowed: Bool) async throws -> NSImage {
@@ -401,23 +496,59 @@ final class PhotoKitLibraryClient: NSObject, PhotoLibraryClient, ResourceLoader,
         )
     }
 
-    private func albumMembership(albums: [AlbumReference]) -> [String: [AlbumReference]] {
-        let collections = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: albums.map(\.id), options: nil)
+    /// Album membership is a library-wide reverse index. Building it per page of
+    /// snapshots would repeat the whole walk thousands of times during one scan, so it
+    /// is built once and held until Photos reports a change.
+    private func albumMembershipIndex() throws -> [String: [AlbumReference]] {
+        membershipLock.lock()
+        if let cachedAlbumMembership {
+            membershipLock.unlock()
+            return cachedAlbumMembership
+        }
+        membershipLock.unlock()
+
+        let albums = try albumReferences()
         let albumsByID = Dictionary(uniqueKeysWithValues: albums.map { ($0.id, $0) })
+        let collections = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: albums.map(\.id), options: nil)
         var membership: [String: [AlbumReference]] = [:]
-        collections.enumerateObjects { collection, _, _ in
+        var cancelled = false
+        collections.enumerateObjects { collection, _, stop in
             guard let reference = albumsByID[collection.localIdentifier] else { return }
-            PHAsset.fetchAssets(in: collection, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(in: collection, options: nil).enumerateObjects { asset, _, innerStop in
+                if Task.isCancelled {
+                    cancelled = true
+                    innerStop.pointee = true
+                    return
+                }
                 membership[asset.localIdentifier, default: []].append(reference)
             }
+            if cancelled { stop.pointee = true }
         }
+        if cancelled { throw CancellationError() }
+
+        membershipLock.lock()
+        cachedAlbumMembership = membership
+        membershipLock.unlock()
         return membership
     }
 
+    private func albumReferences() throws -> [AlbumReference] {
+        let result = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
+        var albums: [AlbumReference] = []
+        result.enumerateObjects { collection, _, _ in
+            guard collection.assetCollectionSubtype != .albumCloudShared else { return }
+            albums.append(.init(
+                id: collection.localIdentifier,
+                title: collection.localizedTitle ?? "Untitled album",
+                canAddContent: collection.canPerform(.addContent)
+            ))
+        }
+        return albums.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+    }
+
     private func assetFetchResults(for scope: ScanScope) -> [PHFetchResult<PHAsset>] {
-        let options = PHFetchOptions()
-        options.includeAssetSourceTypes = [.typeUserLibrary]
-        if scope.kind == .entireLibrary {
+        let options = indexOnlyFetchOptions(scope: scope)
+        guard scope.kind == .selectedAlbums else {
             return [PHAsset.fetchAssets(with: options)]
         }
 

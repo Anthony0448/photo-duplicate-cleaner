@@ -10,7 +10,7 @@ If an original is stored in iCloud, PhotoKit may ask Photos to download it. That
 
 ## Local data
 
-The app stores its inventory cache, saved review session, and cleanup journal in:
+The app stores its fingerprint cache, saved review session, and cleanup journal in:
 
 ```text
 ~/Library/Application Support/PhotoDuplicateCleaner/
@@ -22,4 +22,4 @@ Journal exports are written only to a location selected by the user. Exported JS
 
 ## Removing local data
 
-Quit the app, then delete the `PhotoDuplicateCleaner` folder shown above to remove its cache, saved review, and journal. This does not change the Photos library and cannot restore items already moved to Recently Deleted.
+Quit the app, then delete the `PhotoDuplicateCleaner` folder shown above to remove its cache, saved review, and journal. Files left by earlier versions are removed automatically on launch. This does not change the Photos library and cannot restore items already moved to Recently Deleted.

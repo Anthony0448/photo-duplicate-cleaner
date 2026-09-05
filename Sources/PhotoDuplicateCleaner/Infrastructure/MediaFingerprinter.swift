@@ -3,6 +3,16 @@ import CryptoKit
 import Foundation
 import Vision
 
+/// A decoded Vision feature print, kept behind a reference so the matcher can hold on
+/// to one per asset for the length of a pass.
+final class VisionFeature: @unchecked Sendable {
+    fileprivate let observation: VNFeaturePrintObservation
+
+    fileprivate init(observation: VNFeaturePrintObservation) {
+        self.observation = observation
+    }
+}
+
 final class MediaFingerprinter: Fingerprinting {
     func fingerprint(asset: AssetSnapshot, images: [NSImage]) async throws -> MediaFingerprint {
         guard let primary = images.first, let primaryCGImage = primary.cleanerCGImage else {
@@ -29,16 +39,18 @@ final class MediaFingerprinter: Fingerprinting {
         }.value
     }
 
-    func visionDistance(_ lhs: MediaFingerprint, _ rhs: MediaFingerprint) -> Float? {
-        guard let leftData = lhs.visionFeatureArchive,
-              let rightData = rhs.visionFeatureArchive,
-              let left = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: leftData),
-              let right = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: rightData) else {
+    func visionFeature(from fingerprint: MediaFingerprint) -> VisionFeature? {
+        guard let archive = fingerprint.visionFeatureArchive,
+              let observation = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: archive) else {
             return nil
         }
+        return VisionFeature(observation: observation)
+    }
+
+    func distance(_ lhs: VisionFeature, _ rhs: VisionFeature) -> Float? {
         var distance: Float = 0
         do {
-            try left.computeDistance(&distance, to: right)
+            try lhs.observation.computeDistance(&distance, to: rhs.observation)
             return distance
         } catch {
             return nil
