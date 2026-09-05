@@ -6,19 +6,19 @@ import Testing
 
 @Suite("Duplicate cleaner core")
 struct CoreTests {
-    @Test func binaryExactResourcesFormExactGroup() {
+    @Test func binaryExactResourcesFormExactGroup() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         let hash = String(repeating: "a", count: 64)
         let first = fixture(id: "one", resourceHash: hash)
         let second = fixture(id: "two", resourceHash: hash)
 
-        let groups = matcher.groups(in: [first, second])
+        let groups = try matcher.groups(in: [first, second])
 
         #expect(groups.count == 1)
         #expect(groups.first?.confidence == .binaryExact)
     }
 
-    @Test func contentExactIgnoresDifferentResourceHashes() {
+    @Test func contentExactIgnoresDifferentResourceHashes() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         let fingerprint = MediaFingerprint(
             contentDigest: "same-pixels",
@@ -30,34 +30,34 @@ struct CoreTests {
         first.fingerprint = fingerprint
         second.fingerprint = fingerprint
 
-        let groups = matcher.groups(in: [first, second])
+        let groups = try matcher.groups(in: [first, second])
 
         #expect(groups.first?.confidence == .contentExact)
     }
 
-    @Test func visualThresholdRejectsDifferentImages() {
+    @Test func visualThresholdRejectsDifferentImages() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         var first = fixture(id: "one", resourceHash: nil)
         var second = fixture(id: "two", resourceHash: nil)
         first.fingerprint = MediaFingerprint(perceptualHash: 0, normalizedLuma: [UInt8](repeating: 0, count: 1024))
         second.fingerprint = MediaFingerprint(perceptualHash: UInt64.max, normalizedLuma: [UInt8](repeating: 255, count: 1024))
 
-        #expect(matcher.groups(in: [first, second]).isEmpty)
+        #expect(try matcher.groups(in: [first, second]).isEmpty)
     }
 
-    @Test func conservativeVisualImageMatchIsReviewOnly() {
+    @Test func conservativeVisualImageMatchIsReviewOnly() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         var first = fixture(id: "one", resourceHash: nil)
         var second = fixture(id: "two", resourceHash: nil)
         first.fingerprint = MediaFingerprint(contentDigest: "one", perceptualHash: 0x1000, normalizedLuma: [UInt8](repeating: 120, count: 1024))
         second.fingerprint = MediaFingerprint(contentDigest: "two", perceptualHash: 0x1001, normalizedLuma: [UInt8](repeating: 121, count: 1024))
 
-        let groups = matcher.groups(in: [first, second])
+        let groups = try matcher.groups(in: [first, second])
 
         #expect(groups.first?.confidence == .likelyVisual)
     }
 
-    @Test func videoDurationAndThreeFramesProduceLikelyMatch() {
+    @Test func videoDurationAndThreeFramesProduceLikelyMatch() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         var first = fixture(id: "one", resourceHash: nil)
         var second = fixture(id: "two", resourceHash: nil)
@@ -68,13 +68,13 @@ struct CoreTests {
         first.fingerprint = MediaFingerprint(perceptualHash: 0x1000, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
         second.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
 
-        let groups = matcher.groups(in: [first, second])
+        let groups = try matcher.groups(in: [first, second])
 
         #expect(groups.first?.confidence == .likelyVisual)
         #expect(groups.first?.evidence.contains { $0.contains("10.00s vs 10.10s") } == true)
     }
 
-    @Test func videoDurationDifferenceRejectsOtherwiseSimilarFrames() {
+    @Test func videoDurationDifferenceRejectsOtherwiseSimilarFrames() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         var first = fixture(id: "one", resourceHash: nil)
         var second = fixture(id: "two", resourceHash: nil)
@@ -85,10 +85,10 @@ struct CoreTests {
         first.fingerprint = MediaFingerprint(perceptualHash: 0x1000, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
         second.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
 
-        #expect(matcher.groups(in: [first, second]).isEmpty)
+        #expect(try matcher.groups(in: [first, second]).isEmpty)
     }
 
-    @Test func longVideosUsePercentageBasedDurationTolerance() {
+    @Test func longVideosUsePercentageBasedDurationTolerance() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         var first = fixture(id: "one", resourceHash: nil)
         var second = fixture(id: "two", resourceHash: nil)
@@ -99,10 +99,10 @@ struct CoreTests {
         first.fingerprint = MediaFingerprint(perceptualHash: 0x1000, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
         second.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
 
-        #expect(matcher.groups(in: [first, second]).first?.confidence == .likelyVisual)
+        #expect(try matcher.groups(in: [first, second]).first?.confidence == .likelyVisual)
     }
 
-    @Test func videoGroupRejectsTransitiveDurationDrift() {
+    @Test func videoGroupRejectsTransitiveDurationDrift() throws {
         let matcher = ConservativeDuplicateMatcher(fingerprinting: StubFingerprinter())
         var first = fixture(id: "one", resourceHash: nil)
         var middle = fixture(id: "middle", resourceHash: nil)
@@ -117,7 +117,7 @@ struct CoreTests {
         middle.fingerprint = MediaFingerprint(perceptualHash: 0x1001, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
         last.fingerprint = MediaFingerprint(perceptualHash: 0x1003, normalizedLuma: [], videoFrameHashes: [1, 2, 3])
 
-        #expect(matcher.groups(in: [first, middle, last]).isEmpty)
+        #expect(try matcher.groups(in: [first, middle, last]).isEmpty)
     }
 
     @Test func fidelityPolicyPrefersLivePhotoAndEdits() {
@@ -354,7 +354,7 @@ struct CoreTests {
         let model = CleanerAppModel(
             library: library,
             fingerprinting: StubFingerprinter(),
-            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            cache: AppendingFingerprintCache(url: root.appendingPathComponent("fingerprints.jsonl")),
             journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
             reviewSessionStore: reviewStore
         )
@@ -388,7 +388,7 @@ struct CoreTests {
         let reviewStore = JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
         let scannedAsset = fixture(id: "keeper", resourceHash: "same")
         var changedAsset = scannedAsset
-        changedAsset.isFavorite = true
+        changedAsset.modificationDate = Date(timeIntervalSince1970: 9_000)
         let proposal = MergeProposal(
             id: UUID(), groupID: UUID(), confidence: .binaryExact, keeper: scannedAsset, donors: [],
             donorIDsToDelete: [],
@@ -406,7 +406,7 @@ struct CoreTests {
         let model = CleanerAppModel(
             library: library,
             fingerprinting: StubFingerprinter(),
-            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            cache: AppendingFingerprintCache(url: root.appendingPathComponent("fingerprints.jsonl")),
             journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
             reviewSessionStore: reviewStore
         )
@@ -418,17 +418,21 @@ struct CoreTests {
         #expect(model.showingLibraryChangeRescanPrompt)
     }
 
-    @Test func libraryRevisionIsOrderIndependentButDetectsMetadataChanges() {
+    @Test func libraryRevisionIsOrderIndependentButDetectsPhotosEdits() {
         var first = fixture(id: "one", resourceHash: "old-hash")
         let second = fixture(id: "two", resourceHash: "hash")
         let original = LibraryRevision.signature(for: [first, second])
 
+        // Locally computed hashes are ours, not Photos', so they must not count as a change.
         first.resources[0].sha256 = "newly-computed-hash"
         let reordered = LibraryRevision.signature(for: [second, first])
         #expect(original == reordered)
 
-        first.isFavorite = true
+        // Photos stamps every edit, so the modification date is the change signal.
+        first.modificationDate = Date(timeIntervalSince1970: 5_000)
         #expect(original != LibraryRevision.signature(for: [first, second]))
+
+        #expect(original != LibraryRevision.signature(for: [second]))
     }
 
     @Test @MainActor func modelProjectsReviewGroupsAndReportsPosition() {
@@ -450,7 +454,7 @@ struct CoreTests {
         let model = CleanerAppModel(
             library: ChangeObservingLibraryStub(),
             fingerprinting: StubFingerprinter(),
-            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            cache: AppendingFingerprintCache(url: root.appendingPathComponent("fingerprints.jsonl")),
             journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
             reviewSessionStore: JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
         )
@@ -470,7 +474,7 @@ struct CoreTests {
         let model = CleanerAppModel(
             library: library,
             fingerprinting: StubFingerprinter(),
-            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            cache: AppendingFingerprintCache(url: root.appendingPathComponent("fingerprints.jsonl")),
             journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
             reviewSessionStore: JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
         )
@@ -522,12 +526,13 @@ struct CoreTests {
     }
 }
 
-private struct StubFingerprinter: Fingerprinting {
+struct StubFingerprinter: Fingerprinting {
     func fingerprint(asset: AssetSnapshot, images: [NSImage]) async throws -> MediaFingerprint { MediaFingerprint() }
-    func visionDistance(_ lhs: MediaFingerprint, _ rhs: MediaFingerprint) -> Float? { 0 }
+    func visionFeature(from fingerprint: MediaFingerprint) -> VisionFeature? { nil }
+    func distance(_ lhs: VisionFeature, _ rhs: VisionFeature) -> Float? { 0 }
 }
 
-private final class ChangeObservingLibraryStub: PhotoLibraryClient {
+final class ChangeObservingLibraryStub: PhotoLibraryClient, @unchecked Sendable {
     var assets: [AssetSnapshot]
     var fetchDelayNanoseconds: UInt64 = 0
     private(set) var observedScope: ScanScope?
@@ -541,11 +546,15 @@ private final class ChangeObservingLibraryStub: PhotoLibraryClient {
     func authorizationStatus() -> PhotoLibraryAccess { .authorized }
     func requestAuthorization() async -> PhotoLibraryAccess { .authorized }
     func fetchAlbums() async throws -> [AlbumReference] { [] }
-    func fetchAssets(scope: ScanScope) async throws -> [AssetSnapshot] {
+    func fetchAssetIdentifiers(scope: ScanScope) async throws -> [String] {
         if fetchDelayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: fetchDelayNanoseconds)
         }
-        return assets
+        return assets.map(\.id)
+    }
+    func fetchSnapshots(ids: [String]) async throws -> [AssetSnapshot] {
+        let wanted = Set(ids)
+        return assets.filter { wanted.contains($0.id) }
     }
     func thumbnail(assetID: String, targetSize: CGSize, networkAccessAllowed: Bool) async throws -> NSImage {
         throw CleanerError.assetUnavailable(assetID)

@@ -10,6 +10,9 @@ The app runs locally. It has no analytics, advertising, account system, or devel
 ## Features
 
 - Finds byte-identical media and conservative likely-visual matches.
+- Scans the whole library, chosen albums, or one month at a time.
+- Scans month by month so a very large library can be worked through in batches, stopped after any month, and resumed later.
+- Reports real progress for each phase, can be paused or cancelled at any point, and reuses fingerprints already computed.
 - Uses duration, aspect ratio, and sampled frames to avoid grouping unrelated videos.
 - Requires an explicit keeper and explicit deletion choices.
 - Stops for conflicts involving dates, locations, captions, ratings, hidden states, formats, and edits.
@@ -66,13 +69,21 @@ If Swift reports that the SDK is not supported by the compiler, update or reinst
 ## Workflow
 
 1. Open the app and grant full Photos read/write access.
-2. Scan the personal library or select writable albums.
+2. Choose a scope: the whole library, writable albums, or **Months**.
 3. Wait while thumbnails are fingerprinted and only candidate originals are hashed.
 4. Click a photo or video preview, or focus its card and press Space, to inspect it at a large size. Choose the keeper and explicitly review every deletion choice.
 5. Resolve the metadata choices in **Metadata to preserve**, choose **Add to Cleanup Batch**, and inspect the thumbnail-based keep/delete comparison.
 6. Confirm cleanup, verify the keepers and Recently Deleted in Photos, and export the JSON/CSV journal if desired.
 
 If Photos changes after a scan, whether while the app is open or between launches, the app preserves the existing review, marks it stale, and offers a fresh scan. Choosing **Later** avoids repeated prompts for that stale scan, but cleanup remains disabled until verification succeeds.
+
+## Scanning very large libraries
+
+A whole-library scan compares every asset against every other, which is what finds copies filed under different dates. That comparison has to hold the whole library's fingerprints at once, so on libraries of a few hundred thousand items it is slow and memory-hungry even though it is interruptible.
+
+**Months** exists for that case. The app reads a capture-date histogram of the library, you pick the months to cover, and each month is scanned as its own batch. Progress names the batch being compared, groups appear as each month finishes, and the scan can be stopped and resumed from the next unscanned month. Because each batch is self-contained, month batches only find copies that share a capture month; copies filed under different months need a whole-library scan.
+
+Fingerprints and original hashes are cached across scans, so rescanning after adding a few photos only does work for what changed. Assets Photos cannot produce, usually ones still downloading from iCloud, are skipped and reported instead of failing the scan.
 
 ## Contributing and security
 

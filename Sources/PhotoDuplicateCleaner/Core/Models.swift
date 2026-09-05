@@ -260,22 +260,250 @@ struct ScanScope: Codable, Equatable, Sendable {
     enum Kind: String, Codable, CaseIterable, Identifiable, Sendable {
         case entireLibrary
         case selectedAlbums
+        case months
 
         var id: String { rawValue }
+        /// Kept short: these are the three segments of a control in a narrow sidebar.
         var label: String {
             switch self {
-            case .entireLibrary: return "Entire library"
-            case .selectedAlbums: return "Selected albums"
+            case .entireLibrary: return "Library"
+            case .selectedAlbums: return "Albums"
+            case .months: return "Months"
             }
         }
     }
 
+    /// Narrows a fetch to one capture-date slice so a huge library can be walked
+    /// in batches instead of one unbounded pass.
+    enum CaptureFilter: Codable, Equatable, Sendable {
+        /// Half-open `start ..< end`, so adjacent months never overlap.
+        case window(start: Date, end: Date)
+        case undated
+    }
+
     var kind: Kind = .entireLibrary
     var albumIDs: Set<String> = []
+    var monthIDs: Set<String> = []
+    var captureFilter: CaptureFilter? = nil
+
+    /// The scope the user configured, without any single-batch narrowing applied.
+    var withoutCaptureFilter: ScanScope {
+        var copy = self
+        copy.captureFilter = nil
+        return copy
+    }
+}
+
+/// One month's worth of the library, used both to describe what is available and
+/// to drive a single batch of a by-month scan.
+struct MonthBucket: Codable, Hashable, Identifiable, Sendable {
+    static let undatedIdentifier = "undated"
+
+    var id: String
+    var start: Date?
+    var end: Date?
+    var assetCount: Int
+
+    var isUndated: Bool { start == nil || end == nil }
+    var year: Int? { Int(id.prefix(4)) }
+
+    var title: String {
+        guard let start else { return "No capture date" }
+        return start.formatted(.dateTime.year().month(.wide))
+    }
+
+    var shortTitle: String {
+        guard let start else { return "Undated" }
+        return start.formatted(.dateTime.month(.abbreviated))
+    }
+
+    var captureFilter: ScanScope.CaptureFilter {
+        guard let start, let end else { return .undated }
+        return .window(start: start, end: end)
+    }
+}
+
+enum MonthBucketing {
+    static func identifier(for date: Date?, calendar: Calendar = .current) -> String {
+        guard let date else { return MonthBucket.undatedIdentifier }
+        let components = calendar.dateComponents([.year, .month], from: date)
+        guard let year = components.year, let month = components.month else { return MonthBucket.undatedIdentifier }
+        return String(format: "%04d-%02d", year, month)
+    }
+
+    static func window(for identifier: String, calendar: Calendar = .current) -> (start: Date, end: Date)? {
+        let parts = identifier.split(separator: "-")
+        guard parts.count == 2, let year = Int(parts[0]), let month = Int(parts[1]), (1...12).contains(month),
+              let start = calendar.date(from: DateComponents(year: year, month: month, day: 1)),
+              let end = calendar.date(byAdding: .month, value: 1, to: start) else { return nil }
+        return (start, end)
+    }
+
+    static func bucket(identifier: String, assetCount: Int, calendar: Calendar = .current) -> MonthBucket {
+        let range = window(for: identifier, calendar: calendar)
+        return MonthBucket(id: range == nil ? MonthBucket.undatedIdentifier : identifier,
+                           start: range?.start,
+                           end: range?.end,
+                           assetCount: assetCount)
+    }
+
+    /// Newest month first, with undated assets last so the common case is on top.
+    static func buckets(forCaptureDates dates: [Date?], calendar: Calendar = .current) -> [MonthBucket] {
+        var counts: [String: Int] = [:]
+        for date in dates { counts[identifier(for: date, calendar: calendar), default: 0] += 1 }
+        return counts
+            .map { bucket(identifier: $0.key, assetCount: $0.value, calendar: calendar) }
+            .sorted(by: isOrderedBefore)
+    }
+
+    static func isOrderedBefore(_ lhs: MonthBucket, _ rhs: MonthBucket) -> Bool {
+        switch (lhs.start, rhs.start) {
+        case let (left?, right?): return left > right
+        case (_?, nil): return true
+        case (nil, _?): return false
+        case (nil, nil): return lhs.id < rhs.id
+        }
+    }
+}
+
+/// A single unit of scanning work. Whole-library and album scans are one segment;
+/// a by-month scan is one segment per selected month.
+struct ScanSegment: Codable, Equatable, Identifiable, Sendable {
+    var id: String
+    var title: String
+    var scope: ScanScope
+}
+
+enum ScanPlanner {
+    static let entireLibraryID = "entire-library"
+    static let selectedAlbumsID = "selected-albums"
+
+    static func segments(for scope: ScanScope, months: [MonthBucket]) -> [ScanSegment] {
+        switch scope.kind {
+        case .entireLibrary:
+            return [ScanSegment(id: entireLibraryID, title: "Whole library", scope: scope.withoutCaptureFilter)]
+        case .selectedAlbums:
+            return [ScanSegment(id: selectedAlbumsID, title: "Selected albums", scope: scope.withoutCaptureFilter)]
+        case .months:
+            return months
+                .filter { scope.monthIDs.contains($0.id) && $0.assetCount > 0 }
+                .sorted(by: MonthBucketing.isOrderedBefore)
+                .map { bucket in
+                    var segmentScope = scope.withoutCaptureFilter
+                    segmentScope.monthIDs = [bucket.id]
+                    segmentScope.captureFilter = bucket.captureFilter
+                    return ScanSegment(id: bucket.id, title: bucket.title, scope: segmentScope)
+                }
+        }
+    }
+}
+
+/// Tracks which segments of a multi-batch scan are already done so a cancelled or
+/// interrupted run can pick up where it stopped instead of starting over.
+struct BatchScanState: Codable, Equatable, Sendable {
+    var segments: [ScanSegment]
+    var completedSegmentIDs: Set<String> = []
+    var activeSegmentID: String? = nil
+
+    var pendingSegments: [ScanSegment] { segments.filter { !completedSegmentIDs.contains($0.id) } }
+    var completedCount: Int { segments.count - pendingSegments.count }
+    var isComplete: Bool { pendingSegments.isEmpty }
+    var isMultiSegment: Bool { segments.count > 1 }
+
+    /// One-based position of the segment being scanned, for progress labels.
+    var activePosition: Int? {
+        guard let activeSegmentID, let index = segments.firstIndex(where: { $0.id == activeSegmentID }) else { return nil }
+        return index + 1
+    }
+}
+
+/// Identity plus change stamp for one asset. Cheap enough to gather for an entire
+/// library, unlike a full snapshot, so it is what staleness checks compare.
+struct AssetRevisionToken: Codable, Hashable, Sendable {
+    var id: String
+    var modificationDate: Date?
+}
+
+enum LibraryRevision {
+    static func signature(for tokens: [AssetRevisionToken]) -> String {
+        var hasher = SHA256()
+        for token in tokens.sorted(by: { $0.id < $1.id }) {
+            hasher.update(data: Data(token.id.utf8))
+            let stamp = token.modificationDate?.timeIntervalSinceReferenceDate ?? .infinity
+            hasher.update(data: withUnsafeBytes(of: stamp.bitPattern.littleEndian) { Data($0) })
+            hasher.update(data: Data([0x1e]))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func tokens(for assets: [AssetSnapshot]) -> [AssetRevisionToken] {
+        assets.map { AssetRevisionToken(id: $0.id, modificationDate: $0.modificationDate) }
+    }
+
+    static func signature(for assets: [AssetSnapshot]) -> String { signature(for: tokens(for: assets)) }
+}
+
+/// What the app reuses between scans. Only the derived data is stored, so the file
+/// stays a fraction of the size of a full snapshot inventory.
+struct FingerprintRecord: Codable, Equatable, Sendable {
+    struct ResourceHash: Codable, Equatable, Sendable {
+        var sha256: String
+        var byteCount: Int64?
+    }
+
+    var id: String
+    var modificationDate: Date?
+    var matcherVersion: Int = MediaFingerprint.matcherVersion
+    var fingerprint: MediaFingerprint?
+    var resourceHashes: [String: ResourceHash] = [:]
+}
+
+extension AssetSnapshot {
+    var fingerprintRecord: FingerprintRecord {
+        var hashes: [String: FingerprintRecord.ResourceHash] = [:]
+        for resource in resources {
+            guard let sha256 = resource.sha256 else { continue }
+            hashes[resource.key] = .init(sha256: sha256, byteCount: resource.byteCount)
+        }
+        return FingerprintRecord(
+            id: id,
+            modificationDate: modificationDate,
+            fingerprint: fingerprint,
+            resourceHashes: hashes
+        )
+    }
+
+    /// Reuses previously computed work when the asset has not changed in Photos and
+    /// the record came from the current matcher.
+    mutating func applyCachedWork(_ record: FingerprintRecord) -> Bool {
+        guard record.id == id,
+              record.matcherVersion == MediaFingerprint.matcherVersion,
+              record.modificationDate == modificationDate else { return false }
+        if let cached = record.fingerprint, cached.matcherVersion == MediaFingerprint.matcherVersion {
+            fingerprint = cached
+        }
+        for index in resources.indices {
+            guard let saved = record.resourceHashes[resources[index].key] else { continue }
+            resources[index].sha256 = saved.sha256
+            resources[index].byteCount = saved.byteCount
+        }
+        return true
+    }
+}
+
+extension MergeProposal {
+    /// Review and cleanup never read fingerprints, and they dominate a snapshot's
+    /// size, so they are dropped before a session is held long term or written out.
+    var withoutFingerprints: MergeProposal {
+        var copy = self
+        copy.keeper.fingerprint = nil
+        for index in copy.donors.indices { copy.donors[index].fingerprint = nil }
+        return copy
+    }
 }
 
 struct SavedReviewSession: Codable, Sendable {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     var schemaVersion: Int = SavedReviewSession.schemaVersion
     var matcherVersion: Int = MediaFingerprint.matcherVersion
@@ -284,33 +512,13 @@ struct SavedReviewSession: Codable, Sendable {
     var scope: ScanScope
     var proposals: [MergeProposal]
     var libraryRevision: String? = nil
-}
-
-enum LibraryRevision {
-    static func signature(for assets: [AssetSnapshot]) -> String {
-        var normalized = assets.sorted { $0.id < $1.id }
-        for index in normalized.indices {
-            normalized[index].fingerprint = nil
-            normalized[index].keywords.sort()
-            normalized[index].albums.sort { $0.id < $1.id }
-            normalized[index].resources.sort { $0.key < $1.key }
-            for resourceIndex in normalized[index].resources.indices {
-                normalized[index].resources[resourceIndex].sha256 = nil
-                normalized[index].resources[resourceIndex].byteCount = nil
-            }
-        }
-
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys]
-        let data = (try? encoder.encode(normalized)) ?? Data()
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
+    var batch: BatchScanState? = nil
+    var months: [MonthBucket] = []
 }
 
 struct ScanProgress: Equatable, Sendable {
     enum Phase: String, Sendable {
-        case inventory = "Inventory"
+        case inventory = "Reading Photos metadata"
         case thumbnails = "Fingerprinting"
         case confirming = "Confirming originals"
         case matching = "Matching"
@@ -320,6 +528,8 @@ struct ScanProgress: Equatable, Sendable {
     var completed: Int
     var total: Int
     var detail: String
+    /// Set while a multi-batch scan is running, e.g. "Month 3 of 14 · July 2024".
+    var batchLabel: String? = nil
 
     var fraction: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 }

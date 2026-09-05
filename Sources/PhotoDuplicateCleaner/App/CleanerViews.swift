@@ -308,8 +308,14 @@ struct CleanerRootView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if model.state == .scanning, let progress = model.progress {
-            ScanProgressView(progress: progress, paused: model.isPaused)
+        if model.state == .scanning {
+            // A scan briefly has no measured phase, between batches and while the Photos
+            // index is being read. Showing the idle screen there would offer a Scan
+            // button in the middle of a scan.
+            ScanProgressView(
+                progress: model.progress ?? ScanProgress(phase: .inventory, completed: 0, total: 1, detail: "Reading the Photos index"),
+                paused: model.isPaused
+            )
         } else if let proposal = model.selectedProposal {
             ProposalDetailView(model: model, proposal: proposal)
                 .id(proposal.id.uuidString + "-\(proposal.conflicts.count)-\(proposal.keeper.id)-\(proposal.donorIDsToDelete.sorted().joined())")
@@ -324,7 +330,11 @@ struct CleanerRootView: View {
                 Button(model.isPaused ? "Resume" : "Pause", systemImage: model.isPaused ? "play.fill" : "pause.fill") { model.pauseOrResume() }
                 Button("Cancel", systemImage: "xmark") { model.cancelScan() }
             } else {
+                if model.canResumeScan {
+                    Button("Resume", systemImage: "play.fill") { model.resumeScan() }
+                }
                 Button(model.hasSavedScan ? "Rescan" : "Scan", systemImage: "arrow.clockwise") { model.requestScan() }
+                    .disabled(model.scanScopeIsEmpty)
             }
             Button("Export Journal", systemImage: "square.and.arrow.up") { model.exportJournal() }
                 .disabled(model.journalEntries.isEmpty)
@@ -406,7 +416,27 @@ private struct ScopeView: View {
                     }
                     .frame(maxHeight: 176)
                     .background(Surface.inner, in: RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
+                } else if model.scope.kind == .months {
+                    MonthScopeView(model: model)
                 }
+            }
+
+            if model.canResumeScan {
+                BatchResumeCard(model: model)
+            }
+
+            if !model.scanNotices.isEmpty {
+                VStack(alignment: .leading, spacing: Layout.small) {
+                    ForEach(Array(model.scanNotices.enumerated()), id: \.offset) { notice in
+                        Label(notice.element, systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(Layout.small)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Surface.inner, in: RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
             }
 
             if !model.proposals.isEmpty {
@@ -442,6 +472,160 @@ private struct ScopeView: View {
         }
         .padding(Layout.medium)
         .disabled(model.state == .scanning)
+        .task(id: model.scope.kind) {
+            if model.scope.kind == .months { model.loadMonths() }
+        }
+        .onChange(of: model.authorization) { _, access in
+            if access == .authorized && model.scope.kind == .months { model.loadMonths() }
+        }
+    }
+}
+
+/// Month-sized batches, for libraries too large to compare in one pass.
+private struct MonthScopeView: View {
+    @ObservedObject var model: CleanerAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Layout.small) {
+            if model.isLoadingMonths && model.months.isEmpty {
+                HStack(spacing: Layout.small) {
+                    ProgressView().controlSize(.small)
+                    Text("Grouping your library by month…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if model.months.isEmpty {
+                Text("No photos or videos were found in this library.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: Layout.small) {
+                    Button("All") { model.selectAllMonths() }
+                    Button("None") { model.clearSelectedMonths() }
+                    Spacer(minLength: Layout.tight)
+                    if model.isLoadingMonths { ProgressView().controlSize(.small) }
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: Layout.small, pinnedViews: [.sectionHeaders]) {
+                        ForEach(yearGroups, id: \.year) { group in
+                            Section {
+                                ForEach(group.months) { month in
+                                    Toggle(isOn: Binding(
+                                        get: { model.scope.monthIDs.contains(month.id) },
+                                        set: { _ in model.toggleMonth(month.id) }
+                                    )) {
+                                        HStack(spacing: Layout.tight) {
+                                            Text(month.shortTitle)
+                                            Spacer(minLength: Layout.tight)
+                                            Text(month.assetCount, format: .number)
+                                                .foregroundStyle(.secondary)
+                                                .monospacedDigit()
+                                        }
+                                    }
+                                    .lineLimit(1)
+                                }
+                            } header: {
+                                YearHeader(model: model, group: group)
+                            }
+                        }
+                    }
+                    .padding(Layout.small)
+                }
+                .frame(maxHeight: 220)
+                .background(Surface.inner, in: RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
+
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var summary: String {
+        guard !model.selectedMonths.isEmpty else {
+            return "Pick the months to compare. Each month is scanned as its own batch, so you can stop after any month and pick up the rest later."
+        }
+        let monthCount = model.selectedMonths.count
+        let items = model.selectedMonthAssetCount.formatted(.number)
+        return "\(monthCount) \(pluralized(monthCount, "month", "months")) selected · \(items) \(pluralized(model.selectedMonthAssetCount, "item", "items")). Batches only compare within a month, so copies filed under different months need a whole-library scan."
+    }
+
+    private var yearGroups: [YearGroup] {
+        var order: [String] = []
+        var grouped: [String: [MonthBucket]] = [:]
+        for month in model.months {
+            let key = month.year.map(String.init) ?? "Undated"
+            if grouped[key] == nil { order.append(key) }
+            grouped[key, default: []].append(month)
+        }
+        return order.map { YearGroup(year: $0, months: grouped[$0] ?? []) }
+    }
+}
+
+private struct YearGroup {
+    let year: String
+    let months: [MonthBucket]
+}
+
+private struct YearHeader: View {
+    @ObservedObject var model: CleanerAppModel
+    let group: YearGroup
+
+    var body: some View {
+        HStack(spacing: Layout.small) {
+            Text(group.year)
+                .font(.caption.weight(.semibold))
+            Text(assetCount, format: .number)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Spacer(minLength: Layout.tight)
+            Button(allSelected ? "Clear" : "Add") {
+                let ids = group.months.map(\.id)
+                if allSelected { model.deselectMonths(ids) } else { model.selectMonths(ids) }
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+        }
+        .padding(.vertical, Layout.micro)
+        .background(Surface.card)
+    }
+
+    private var assetCount: Int {
+        group.months.reduce(0) { $0 + $1.assetCount }
+    }
+
+    private var allSelected: Bool {
+        !group.months.isEmpty && group.months.allSatisfy { model.scope.monthIDs.contains($0.id) }
+    }
+}
+
+/// Shown when a batched scan stopped early, so the remaining months are one click away.
+private struct BatchResumeCard: View {
+    @ObservedObject var model: CleanerAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Layout.small) {
+            Label(
+                "\(model.completedSegmentCount) of \(model.totalSegmentCount) batches compared",
+                systemImage: "pause.circle"
+            )
+            .font(.caption)
+            ProgressView(value: Double(model.completedSegmentCount), total: Double(max(model.totalSegmentCount, 1)))
+            Text("The groups already found are kept. Resuming compares only the \(model.remainingSegmentCount) remaining \(pluralized(model.remainingSegmentCount, "batch", "batches")).")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Resume Scan", systemImage: "play.fill") { model.resumeScan() }
+                .controlSize(.small)
+        }
+        .padding(Layout.small)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
     }
 }
 
@@ -516,6 +700,15 @@ private struct WelcomeView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
+                .disabled(model.scanScopeIsEmpty)
+
+            if model.scanScopeIsEmpty {
+                Text(model.scope.kind == .months
+                     ? "Choose at least one month in the sidebar."
+                     : "Choose at least one album in the sidebar.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack(spacing: Layout.large) {
                 Label("On-device", systemImage: "lock.shield")
@@ -548,9 +741,14 @@ private struct ScanProgressView: View {
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(Color.accentColor)
             VStack(spacing: Layout.tight) {
+                if let batchLabel = progress.batchLabel {
+                    Text(batchLabel)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                }
                 Text(paused ? "Scan paused" : progress.phase.rawValue)
                     .font(.title3.weight(.semibold))
-                Text("\(progress.completed) of \(progress.total)")
+                Text("\(progress.completed.formatted(.number)) of \(progress.total.formatted(.number))")
                     .font(.callout)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
