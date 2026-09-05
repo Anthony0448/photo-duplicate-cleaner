@@ -72,8 +72,10 @@ final class CleanerAppModel: ObservableObject {
         guard let selectedProposalID else { return proposals.first }
         return proposals.first { $0.id == selectedProposalID }
     }
-    var exactCount: Int { proposals.filter { $0.confidence != .likelyVisual }.count }
-    var likelyCount: Int { proposals.filter { $0.confidence == .likelyVisual }.count }
+    var exactProposals: [MergeProposal] { proposals.filter { $0.confidence != .likelyVisual } }
+    var likelyProposals: [MergeProposal] { proposals.filter { $0.confidence == .likelyVisual } }
+    var exactCount: Int { exactProposals.count }
+    var likelyCount: Int { likelyProposals.count }
     var hasSavedScan: Bool { lastScanDate != nil }
     var libraryChangePromptMessage: String {
         if libraryChangedDuringScan {
@@ -157,6 +159,12 @@ final class CleanerAppModel: ObservableObject {
         progress = nil
         state = hasSavedScan ? .review : .idle
         presentPendingLibraryChangePromptIfPossible()
+    }
+
+    /// One-based position of a proposal in the review list, for the footer counter.
+    func position(of proposalID: UUID) -> (index: Int, total: Int)? {
+        guard let index = proposals.firstIndex(where: { $0.id == proposalID }) else { return nil }
+        return (index + 1, proposals.count)
     }
 
     func toggleAlbum(_ albumID: String) {

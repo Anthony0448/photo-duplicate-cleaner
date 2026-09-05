@@ -431,6 +431,38 @@ struct CoreTests {
         #expect(original != LibraryRevision.signature(for: [first, second]))
     }
 
+    @Test @MainActor func modelProjectsReviewGroupsAndReportsPosition() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let keeper = fixture(id: "keeper", resourceHash: "same")
+        let donor = fixture(id: "donor", resourceHash: "same")
+        let exact = MergeProposal(
+            id: UUID(), groupID: UUID(), confidence: .binaryExact, keeper: keeper, donors: [donor],
+            donorIDsToDelete: [donor.id], proposedCreationDate: nil, proposedLocation: nil,
+            proposedCaption: nil, proposedRating: nil, proposedFavorite: false, proposedHidden: false,
+            proposedKeywords: [], albumsToAdd: [], conflicts: [], isApproved: false
+        )
+        let likely = MergeProposal(
+            id: UUID(), groupID: UUID(), confidence: .likelyVisual, keeper: donor, donors: [keeper],
+            donorIDsToDelete: [keeper.id], proposedCreationDate: nil, proposedLocation: nil,
+            proposedCaption: nil, proposedRating: nil, proposedFavorite: false, proposedHidden: false,
+            proposedKeywords: [], albumsToAdd: [], conflicts: [], isApproved: false
+        )
+        let model = CleanerAppModel(
+            library: ChangeObservingLibraryStub(),
+            fingerprinting: StubFingerprinter(),
+            cache: JSONInventoryCache(url: root.appendingPathComponent("inventory.json")),
+            journal: JSONJournalStore(url: root.appendingPathComponent("journal.json")),
+            reviewSessionStore: JSONReviewSessionStore(url: root.appendingPathComponent("review.json"))
+        )
+        model.proposals = [exact, likely]
+
+        #expect(model.exactProposals.map(\.id) == [exact.id])
+        #expect(model.likelyProposals.map(\.id) == [likely.id])
+        #expect(model.position(of: exact.id)?.index == 1)
+        #expect(model.position(of: exact.id)?.total == 2)
+        #expect(model.position(of: UUID()) == nil)
+    }
+
     @Test @MainActor func changeDuringScanCancelsBeforePublishingResultsAndPromptsAgain() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let library = ChangeObservingLibraryStub()

@@ -3,75 +3,85 @@ import AVFoundation
 import AVKit
 import SwiftUI
 
-private enum CleanerStyle {
-    static let accent = Color(red: 0.30, green: 0.47, blue: 1.0)
-    static let mint = Color(red: 0.25, green: 0.88, blue: 0.76)
-    static let panelRadius: CGFloat = 22
+// MARK: - Design tokens
+
+/// Spacing and radius values shared by every screen. Sections step in multiples
+/// of eight so the banner, cards, panels, and footer keep the same rhythm.
+private enum Layout {
+    static let micro: CGFloat = 2
+    static let tight: CGFloat = 4
+    static let small: CGFloat = 8
+    static let snug: CGFloat = 12
+    static let medium: CGFloat = 16
+    static let large: CGFloat = 24
+
+    static let cardRadius: CGFloat = 12
+    static let innerRadius: CGFloat = 10
+    static let controlRadius: CGFloat = 8
+
+    static let cardWidth: CGFloat = 316
+    static let mediaHeight: CGFloat = 208
+    static let attributeRowHeight: CGFloat = 16
+    static let batchMediaHeight: CGFloat = 120
+    static let actionRowHeight: CGFloat = 20
 }
 
-private struct AmbientBackdrop: View {
-    @Environment(\.colorScheme) private var colorScheme
+private enum Surface {
+    static let card = Color(nsColor: .controlBackgroundColor)
+    static let inner = Color.primary.opacity(0.05)
+    static let hairline = Color(nsColor: .separatorColor)
+}
 
-    var body: some View {
-        ZStack {
-            Color(nsColor: .windowBackgroundColor)
-            RadialGradient(
-                colors: [CleanerStyle.accent.opacity(colorScheme == .dark ? 0.18 : 0.12), .clear],
-                center: .topTrailing,
-                startRadius: 10,
-                endRadius: 620
-            )
-            RadialGradient(
-                colors: [CleanerStyle.mint.opacity(colorScheme == .dark ? 0.09 : 0.07), .clear],
-                center: .bottomLeading,
-                startRadius: 20,
-                endRadius: 520
-            )
-        }
-        .ignoresSafeArea()
+private enum RoleColor {
+    static let keeper = Color.green
+    static let removal = Color.red
+    static let attention = Color.orange
+}
+
+private struct CardSurface: ViewModifier {
+    var radius: CGFloat = Layout.cardRadius
+    var accent: Color?
+
+    func body(content: Content) -> some View {
+        content
+            .background(Surface.card, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(accent?.opacity(0.45) ?? Surface.hairline, lineWidth: accent == nil ? 1 : 1.25)
+            }
+            .shadow(color: .black.opacity(0.06), radius: 3, y: 1)
     }
 }
 
-private struct LiquidGlassSurface: ViewModifier {
-    let cornerRadius: CGFloat
-    let tint: Color
-
+/// The sticky footer that carries each screen's single primary action.
+private struct ActionBarSurface: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
 #if PHOTO_MODERN_UI
         if #available(macOS 26.0, *) {
             content
-                .glassEffect(
-                    .regular.tint(tint),
-                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                )
+                .glassEffect(.regular, in: Rectangle())
+                .overlay(alignment: .top) { Divider() }
         } else {
             content
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(.white.opacity(0.16), lineWidth: 0.8)
-                }
-                .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
+                .background(.bar)
+                .overlay(alignment: .top) { Divider() }
         }
 #else
         content
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(.white.opacity(0.16), lineWidth: 0.8)
-            }
-            .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
+            .background(.bar)
+            .overlay(alignment: .top) { Divider() }
 #endif
     }
 }
 
 private extension View {
-    func liquidGlassSurface(
-        cornerRadius: CGFloat = CleanerStyle.panelRadius,
-        tint: Color = CleanerStyle.accent.opacity(0.06)
-    ) -> some View {
-        modifier(LiquidGlassSurface(cornerRadius: cornerRadius, tint: tint))
+    func cardSurface(radius: CGFloat = Layout.cardRadius, accent: Color? = nil) -> some View {
+        modifier(CardSurface(radius: radius, accent: accent))
+    }
+
+    func actionBarSurface() -> some View {
+        modifier(ActionBarSurface())
     }
 }
 
@@ -85,21 +95,164 @@ private func formattedDuration(_ seconds: Double) -> String {
     return String(format: "%d:%02d", minutes, remainingSeconds)
 }
 
+private func formattedBytes(_ bytes: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+}
+
+private extension AssetSnapshot {
+    /// A short, readable stand-in for filenames that are mostly a UUID:
+    /// the capture date plus the first few characters of the longest identifier.
+    var compactLabel: String {
+        let stem = (originalFilename as NSString).deletingPathExtension
+        let identifier = stem
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .filter { $0.count >= 4 && $0.contains(where: \.isNumber) }
+            .max { $0.count < $1.count }
+            .map { String($0.prefix(6)).uppercased() }
+        guard let date = creationDate else {
+            return identifier.map { "\(stem.prefix(12)) · \($0)" } ?? originalFilename
+        }
+        let day = date.formatted(date: .abbreviated, time: .omitted)
+        return identifier.map { "\(day) · \($0)" } ?? day
+    }
+}
+
+private func pluralized(_ count: Int, _ singular: String, _ plural: String) -> String {
+    count == 1 ? singular : plural
+}
+
+// MARK: - Shared building blocks
+
+/// A titled container. Every grouped section on every screen uses this so radii,
+/// padding, and header typography stay identical.
+private struct SectionCard<Content: View>: View {
+    let title: String
+    let systemImage: String
+    var tint: Color = .secondary
+    var caption: String?
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Layout.medium) {
+            HStack(spacing: Layout.small) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint)
+                Text(title)
+                    .font(.headline)
+                Spacer(minLength: Layout.small)
+                if let caption {
+                    Text(caption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            content()
+        }
+        .padding(Layout.medium)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardSurface()
+    }
+}
+
+/// An aligned label/value grid. The label column is trailing-aligned so values
+/// share a single left edge, the way Apple's info panels read.
+private struct SpecGrid: View {
+    struct Item: Identifiable {
+        let label: String
+        let value: String
+        var systemImage: String?
+        var tint: Color?
+        var wraps = false
+
+        var id: String { label }
+    }
+
+    let items: [Item]
+    var labelWidth: CGFloat?
+
+    var body: some View {
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Layout.medium, verticalSpacing: Layout.small) {
+            ForEach(items) { item in
+                GridRow {
+                    Text(item.label)
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.trailing)
+                        .frame(width: labelWidth, alignment: .trailing)
+                    HStack(spacing: Layout.tight) {
+                        if let systemImage = item.systemImage {
+                            Image(systemName: systemImage)
+                                .imageScale(.small)
+                        }
+                        Text(item.value)
+                            .lineLimit(item.wraps ? 3 : 1)
+                            .textSelection(.enabled)
+                    }
+                    .foregroundStyle(item.tint ?? Color.primary)
+                }
+            }
+        }
+        .monospacedDigit()
+    }
+}
+
+private struct RoleBadge: View {
+    let text: String
+    let systemImage: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: Layout.tight) {
+            Image(systemName: systemImage)
+                .imageScale(.small)
+            Text(text)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(color)
+        .padding(.horizontal, Layout.small)
+        .padding(.vertical, Layout.tight)
+        .background(color.opacity(0.12), in: Capsule())
+    }
+}
+
+private struct CountChip: View {
+    let value: Int
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: Layout.tight) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text(value, format: .number)
+                .fontWeight(.semibold)
+                .monospacedDigit()
+            Text(label)
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption)
+        .padding(.horizontal, Layout.small)
+        .padding(.vertical, Layout.tight)
+        .background(Surface.inner, in: Capsule())
+    }
+}
+
+// MARK: - Root
+
 struct CleanerRootView: View {
     @StateObject private var model = CleanerAppModel()
 
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 290, ideal: 330, max: 390)
+                .navigationSplitViewColumnWidth(min: 264, ideal: 296, max: 360)
         } detail: {
-            ZStack {
-                AmbientBackdrop()
-                detail
-            }
+            detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
         }
-        .tint(CleanerStyle.accent)
-        .frame(minWidth: 1120, minHeight: 740)
+        .frame(minWidth: 1_080, minHeight: 720)
         .toolbar { toolbar }
         .sheet(isPresented: $model.showingConfirmation) { BatchConfirmationView(model: model) }
         .alert("Run a new comparison scan?", isPresented: $model.showingRescanConfirmation) {
@@ -125,6 +278,7 @@ struct CleanerRootView: View {
     private var sidebar: some View {
         VStack(spacing: 0) {
             ScopeView(model: model)
+            Divider()
             if model.proposals.isEmpty {
                 ContentUnavailableView(
                     model.state == .scanning ? "Scanning Photos" : "No Review Groups",
@@ -133,22 +287,24 @@ struct CleanerRootView: View {
                 )
             } else {
                 List(selection: $model.selectedProposalID) {
-                    Section("Exact (\(model.exactCount))") {
-                        ForEach(model.proposals.filter { $0.confidence != .likelyVisual }) { proposal in
-                            ProposalRow(proposal: proposal).tag(proposal.id)
+                    if !model.exactProposals.isEmpty {
+                        Section("Exact (\(model.exactCount))") {
+                            ForEach(model.exactProposals) { proposal in
+                                ProposalRow(proposal: proposal).tag(proposal.id)
+                            }
                         }
                     }
-                    Section("Likely visual (\(model.likelyCount))") {
-                        ForEach(model.proposals.filter { $0.confidence == .likelyVisual }) { proposal in
-                            ProposalRow(proposal: proposal).tag(proposal.id)
+                    if !model.likelyProposals.isEmpty {
+                        Section("Likely visual (\(model.likelyCount))") {
+                            ForEach(model.likelyProposals) { proposal in
+                                ProposalRow(proposal: proposal).tag(proposal.id)
+                            }
                         }
                     }
                 }
                 .listStyle(.sidebar)
-                .scrollContentBackground(.hidden)
             }
         }
-        .background(.thinMaterial)
     }
 
     @ViewBuilder private var detail: some View {
@@ -180,6 +336,7 @@ struct CleanerRootView: View {
     private var errorBinding: Binding<Bool> {
         Binding(get: { if case .failed = model.state { return true }; return false }, set: { if !$0 { model.dismissError() } })
     }
+
     private var errorMessage: String {
         if case .failed(let message) = model.state { return message }
         return ""
@@ -194,132 +351,182 @@ struct CleanerRootView: View {
     }
 }
 
+// MARK: - Sidebar
+
 private struct ScopeView: View {
     @ObservedObject var model: CleanerAppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 11) {
+        VStack(alignment: .leading, spacing: Layout.medium) {
+            HStack(spacing: Layout.snug) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .fill(CleanerStyle.accent.gradient)
+                    RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous)
+                        .fill(Color.accentColor)
                     Image(systemName: "photo.stack.fill")
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(.white)
                 }
-                .frame(width: 38, height: 38)
+                .frame(width: 32, height: 32)
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Duplicate Cleaner").font(.headline)
-                    Text("Private & on-device").font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: Layout.micro) {
+                    Text("Duplicate Cleaner")
+                        .font(.subheadline.weight(.semibold))
+                    Text("Private & on-device")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
-            Picker("Library scope", selection: $model.scope.kind) {
-                ForEach(ScanScope.Kind.allCases) { kind in Text(kind.label).tag(kind) }
-            }
-            .pickerStyle(.segmented)
-            if model.authorization != .authorized {
-                Button("Grant Photos Access", systemImage: "photo.badge.checkmark") { model.requestAccessAndLoadAlbums() }
-                    .buttonStyle(.borderedProminent)
-            } else if model.scope.kind == .selectedAlbums {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 5) {
-                        ForEach(model.albums) { album in
-                            Toggle(album.title, isOn: Binding(
-                                get: { model.scope.albumIDs.contains(album.id) },
-                                set: { _ in model.toggleAlbum(album.id) }
-                            ))
-                            .disabled(!album.canAddContent)
+            VStack(alignment: .leading, spacing: Layout.small) {
+                Text("Library scope")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("Library scope", selection: $model.scope.kind) {
+                    ForEach(ScanScope.Kind.allCases) { kind in Text(kind.label).tag(kind) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                if model.authorization != .authorized {
+                    Button("Grant Photos Access", systemImage: "photo.badge.checkmark") { model.requestAccessAndLoadAlbums() }
+                        .buttonStyle(.bordered)
+                } else if model.scope.kind == .selectedAlbums {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: Layout.tight) {
+                            ForEach(model.albums) { album in
+                                Toggle(album.title, isOn: Binding(
+                                    get: { model.scope.albumIDs.contains(album.id) },
+                                    set: { _ in model.toggleAlbum(album.id) }
+                                ))
+                                .lineLimit(1)
+                                .disabled(!album.canAddContent)
+                            }
                         }
+                        .padding(Layout.small)
                     }
-                }.frame(maxHeight: 180)
-            }
-            if !model.proposals.isEmpty {
-                HStack(spacing: 10) {
-                    StatChip(value: model.exactCount, label: "Exact", color: CleanerStyle.mint)
-                    StatChip(value: model.likelyCount, label: "Visual", color: .orange)
+                    .frame(maxHeight: 176)
+                    .background(Surface.inner, in: RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
                 }
-                Button("Add safe exact groups", systemImage: "checkmark.seal") { model.approveAllConflictFreeExact() }
-                    .controlSize(.small)
             }
-            if let date = model.lastScanDate {
-                Label("Saved \(date.formatted(date: .abbreviated, time: .shortened))", systemImage: "clock.arrow.circlepath")
-                    .font(.caption).foregroundStyle(.secondary)
+
+            if !model.proposals.isEmpty {
+                VStack(alignment: .leading, spacing: Layout.small) {
+                    HStack(spacing: Layout.small) {
+                        CountChip(value: model.exactCount, label: "Exact", color: RoleColor.keeper)
+                        CountChip(value: model.likelyCount, label: "Visual", color: RoleColor.attention)
+                    }
+                    if model.exactCount > 0 {
+                        Button("Add safe exact groups", systemImage: "checkmark.seal") { model.approveAllConflictFreeExact() }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                    }
+                }
             }
+
             if model.libraryResultsAreStale {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("Photos changed — rescan recommended", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: Layout.small) {
+                    Label("Photos changed since this scan", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(RoleColor.attention)
                     Button("Rescan Now") { model.rescanAfterLibraryChange() }
                         .controlSize(.small)
                 }
+                .padding(Layout.small)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoleColor.attention.opacity(0.10), in: RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
+            } else if let date = model.lastScanDate {
+                Text("Saved \(date.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(18)
+        .padding(Layout.medium)
         .disabled(model.state == .scanning)
     }
 }
 
-private struct StatChip: View {
-    let value: Int
-    let label: String
-    let color: Color
+private struct ProposalRow: View {
+    let proposal: MergeProposal
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(value, format: .number).fontWeight(.bold).monospacedDigit()
-            Text(label).foregroundStyle(.secondary)
+        HStack(spacing: Layout.small) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 7, height: 7)
+            Text(proposal.keeper.compactLabel)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: Layout.tight)
+            // A shape cue as well as colour for the state users act on most.
+            if proposal.isApproved {
+                Image(systemName: "checkmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
         }
-        .font(.caption)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(color.opacity(0.12), in: Capsule())
+        .padding(.vertical, Layout.tight)
+        .help(tooltip)
+    }
+
+    private var statusColor: Color {
+        if proposal.isApproved { return RoleColor.keeper }
+        if !proposal.conflicts.isEmpty { return RoleColor.attention }
+        return Color.secondary.opacity(0.35)
+    }
+
+    private var tooltip: String {
+        let status: String
+        if proposal.isApproved {
+            status = "In cleanup batch · \(proposal.selectedDonors.count) to delete"
+        } else if !proposal.conflicts.isEmpty {
+            status = "\(proposal.conflicts.count) metadata \(pluralized(proposal.conflicts.count, "choice", "choices")) to make"
+        } else if proposal.selectedDonors.isEmpty {
+            status = "No copies marked for deletion yet"
+        } else {
+            status = "Ready to add · \(proposal.selectedDonors.count) to delete"
+        }
+        return "\(proposal.keeper.originalFilename)\n\(proposal.confidence.label) · \(status)"
     }
 }
+
+// MARK: - Idle and progress
 
 private struct WelcomeView: View {
     @ObservedObject var model: CleanerAppModel
 
     var body: some View {
-        VStack(spacing: 22) {
-            ZStack {
-                Circle().fill(CleanerStyle.accent.opacity(0.14))
-                Image(systemName: model.hasSavedScan ? "checkmark.seal.fill" : "photo.on.rectangle.angled")
-                    .font(.system(size: 44, weight: .medium))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(model.hasSavedScan ? CleanerStyle.mint : CleanerStyle.accent)
-            }
-            .frame(width: 92, height: 92)
+        VStack(spacing: Layout.large) {
+            Image(systemName: model.hasSavedScan ? "checkmark.circle" : "photo.on.rectangle.angled")
+                .font(.system(size: 48, weight: .light))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(model.hasSavedScan ? RoleColor.keeper : Color.accentColor)
 
-            VStack(spacing: 8) {
+            VStack(spacing: Layout.small) {
                 Text(model.hasSavedScan ? "Your library is tidy" : "Find duplicates, keep the best")
-                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                    .font(.title2.weight(.semibold))
                 Text(welcomeDescription)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                    .frame(maxWidth: 520)
-                    .lineSpacing(3)
+                    .frame(maxWidth: 420)
             }
 
-            Button(model.hasSavedScan ? "Scan Again" : "Scan Photo Library", systemImage: "sparkles") {
-                model.requestScan()
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            Button(model.hasSavedScan ? "Scan Again" : "Scan Photo Library") { model.requestScan() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
 
-            HStack(spacing: 20) {
+            HStack(spacing: Layout.large) {
                 Label("On-device", systemImage: "lock.shield")
                 Label("Review first", systemImage: "eye")
                 Label("Recently Deleted", systemImage: "arrow.uturn.backward.circle")
             }
-            .font(.caption.weight(.medium))
+            .font(.caption)
             .foregroundStyle(.secondary)
+            .padding(.top, Layout.small)
         }
-        .padding(44)
-        .liquidGlassSurface(cornerRadius: 32)
-        .padding(48)
+        .padding(Layout.large)
     }
 
     private var welcomeDescription: String {
@@ -335,55 +542,36 @@ private struct ScanProgressView: View {
     let paused: Bool
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: paused ? "pause.circle.fill" : "photo.stack.fill")
-                .font(.system(size: 52)).symbolRenderingMode(.hierarchical).foregroundStyle(CleanerStyle.accent)
-            Text(paused ? "Scan paused" : progress.phase.rawValue).font(.title.bold())
-            ProgressView(value: progress.fraction).frame(width: 420).controlSize(.large)
-            Text("\(progress.completed) of \(progress.total)").font(.headline).monospacedDigit()
-            Text(progress.detail).foregroundStyle(.secondary).lineLimit(1)
+        VStack(spacing: Layout.medium) {
+            Image(systemName: paused ? "pause.circle" : "photo.stack")
+                .font(.system(size: 36, weight: .light))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(Color.accentColor)
+            VStack(spacing: Layout.tight) {
+                Text(paused ? "Scan paused" : progress.phase.rawValue)
+                    .font(.title3.weight(.semibold))
+                Text("\(progress.completed) of \(progress.total)")
+                    .font(.callout)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: progress.fraction)
+                .frame(width: 320)
+            Text(progress.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: 360)
         }
-        .padding(38)
-        .liquidGlassSurface(cornerRadius: 28)
+        .padding(Layout.large)
     }
 }
 
-private struct ProposalRow: View {
-    let proposal: MergeProposal
+// MARK: - Review
 
-    var body: some View {
-        HStack(spacing: 11) {
-            Image(systemName: statusIcon)
-                .foregroundStyle(statusColor)
-                .font(.system(size: 16, weight: .semibold))
-            VStack(alignment: .leading) {
-                Text(proposal.keeper.originalFilename).fontWeight(.medium).lineLimit(1)
-                Text(statusText)
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.vertical, 5)
-    }
-
-    private var statusIcon: String {
-        if proposal.isApproved { return "checkmark.circle.fill" }
-        if !proposal.conflicts.isEmpty { return "exclamationmark.triangle.fill" }
-        if proposal.selectedDonors.isEmpty { return "hand.tap" }
-        return "circle.dashed"
-    }
-
-    private var statusColor: Color {
-        if proposal.isApproved { return .green }
-        if !proposal.conflicts.isEmpty { return .orange }
-        return .secondary
-    }
-
-    private var statusText: String {
-        if proposal.isApproved { return "Ready • deletes \(proposal.selectedDonors.count)" }
-        if !proposal.conflicts.isEmpty { return "Resolve \(proposal.conflicts.count) metadata conflict\(proposal.conflicts.count == 1 ? "" : "s")" }
-        if proposal.selectedDonors.isEmpty { return "Choose copies to delete • \(proposal.confidence.label)" }
-        return "Not yet added • deletes \(proposal.selectedDonors.count)"
-    }
+private enum CopyDisposition: Hashable {
+    case keep
+    case delete
 }
 
 private struct ProposalDetailView: View {
@@ -392,131 +580,211 @@ private struct ProposalDetailView: View {
     @State private var previewedAsset: AssetSnapshot?
 
     private var assets: [AssetSnapshot] { [proposal.keeper] + proposal.donors }
+    private var showsDuration: Bool { assets.contains { $0.mediaKind == .video } }
+    private var locationNeedsAttention: Bool { Set(assets.map { $0.location != nil }).count > 1 }
+    private var reclaimedBytes: Int64 { proposal.selectedDonors.reduce(0) { $0 + $1.totalKnownBytes } }
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(proposal.confidence.label)
-                                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                                Text("Compare every copy, then choose what stays.").foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if proposal.isApproved {
-                                Label("In Cleanup Batch", systemImage: "checkmark.circle.fill")
-                                    .font(.headline).foregroundStyle(CleanerStyle.mint)
-                                    .padding(.horizontal, 12).padding(.vertical, 7)
-                                    .background(CleanerStyle.mint.opacity(0.12), in: Capsule())
-                            }
-                        }
-                        ReviewSteps(proposal: proposal)
-                    }
-                    .padding(20)
-                    .liquidGlassSurface()
-
-                    ScrollView(.horizontal) {
-                        HStack(alignment: .top, spacing: 14) {
-                            ForEach(assets) { asset in
-                                AssetCard(
-                                    library: model.library,
-                                    asset: asset,
-                                    isKeeper: asset.id == proposal.keeper.id,
-                                    willDelete: proposal.donorIDsToDelete.contains(asset.id),
-                                    locationNeedsAttention: Set(assets.map { $0.location != nil }).count > 1,
-                                    quickLook: { previewedAsset = asset },
-                                    chooseKeeper: { model.chooseKeeper(proposalID: proposal.id, assetID: asset.id) },
-                                    toggleDeletion: { model.toggleDeletion(proposalID: proposal.id, assetID: asset.id) }
-                                )
-                            }
-                        }
-                    }
-
-                    if !proposal.conflicts.isEmpty {
-                        GroupBox("Choose metadata to preserve") {
-                            VStack(alignment: .leading, spacing: 14) {
-                                ForEach(proposal.conflicts) { conflict in
-                                    VStack(alignment: .leading, spacing: 7) {
-                                        Label(conflict.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                                        Text("Select the value to keep:").font(.caption).foregroundStyle(.secondary)
-                                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 235, maximum: 340), spacing: 10)], alignment: .leading, spacing: 10) {
-                                            ForEach(Array(([proposal.keeper] + proposal.selectedDonors).enumerated()), id: \.element.id) { index, asset in
-                                                MetadataChoiceCard(
-                                                    library: model.library,
-                                                    asset: asset,
-                                                    isKeeper: index == 0,
-                                                    roleLabel: index == 0 ? "Selected keeper" : "Copy \(index + 1) • marked DELETE",
-                                                    value: conflictValue(conflict.field, asset: asset)
-                                                ) {
-                                                    model.resolve(conflict, proposalID: proposal.id, using: asset.id)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .groupBoxStyle(GlassGroupBoxStyle(icon: "slider.horizontal.3", tint: .orange))
-                    }
-
-                    GroupBox("What will happen") {
-                        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
-                            MetadataGridRow(label: "Keep in Photos", value: proposal.keeper.originalFilename)
-                            MetadataGridRow(label: "Move to Recently Deleted", value: proposal.selectedDonors.isEmpty ? "Nothing selected" : proposal.selectedDonors.map(\.originalFilename).joined(separator: ", "))
-                            MetadataGridRow(label: "Also keep", value: proposal.retainedCandidates.isEmpty ? "No additional copies" : proposal.retainedCandidates.map(\.originalFilename).joined(separator: ", "))
-                            MetadataGridRow(label: "Capture date", value: proposal.proposedCreationDate?.formatted(date: .abbreviated, time: .standard) ?? "None")
-                            MetadataGridRow(label: "Location", value: proposal.proposedLocation.map { String(format: "%.5f, %.5f", $0.latitude, $0.longitude) } ?? "None")
-                            MetadataGridRow(label: "Caption", value: proposal.proposedCaption ?? "None")
-                            MetadataGridRow(label: "Favorite", value: proposal.proposedFavorite ? "Yes" : "No")
-                            MetadataGridRow(label: "Keywords", value: proposal.proposedKeywords.isEmpty ? "None" : proposal.proposedKeywords.joined(separator: ", "))
-                            MetadataGridRow(label: "Albums added", value: proposal.albumsToAdd.isEmpty ? "None" : proposal.albumsToAdd.map(\.title).joined(separator: ", "))
-                        }.frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .groupBoxStyle(GlassGroupBoxStyle(icon: "arrow.right.circle", tint: CleanerStyle.accent))
-
+                VStack(alignment: .leading, spacing: Layout.large) {
+                    header
+                    comparison
+                    if !proposal.conflicts.isEmpty { conflictSection }
+                    summarySection
                     if proposal.confidence == .likelyVisual {
-                        Label("This is a visual match. All non-keepers are initially marked DELETE; use Undo Delete on any copy you want to retain.", systemImage: "eye.trianglebadge.exclamationmark")
-                            .foregroundStyle(.orange)
+                        Text("Likely visual matches start with every non-keeper marked for deletion. Switch any copy back to Keep to leave it in Photos.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
-                .padding(26)
+                .padding(Layout.large)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            reviewActions
+            actionBar
         }
         .sheet(item: $previewedAsset) { asset in
             MediaQuickLookView(library: model.library, asset: asset)
         }
     }
 
-    private var reviewActions: some View {
-        HStack(spacing: 12) {
-            Button("Previous", systemImage: "chevron.left") { model.selectAdjacent(to: proposal.id, offset: -1) }
-            Button("Next", systemImage: "chevron.right") { model.selectAdjacent(to: proposal.id, offset: 1) }
-            Spacer()
+    // Quiet page title, then a demoted step trail. Neither competes with the cards.
+    private var header: some View {
+        VStack(alignment: .leading, spacing: Layout.small) {
+            HStack(alignment: .firstTextBaseline, spacing: Layout.medium) {
+                VStack(alignment: .leading, spacing: Layout.micro) {
+                    Text("Compare copies")
+                        .font(.headline)
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if proposal.isApproved {
+                    RoleBadge(text: "In cleanup batch", systemImage: "checkmark.circle.fill", color: RoleColor.keeper)
+                }
+            }
+            ReviewSteps(proposal: proposal)
+        }
+    }
+
+    private var subtitle: String {
+        "\(assets.count) copies · \(proposal.confidence.label)"
+    }
+
+    private var comparison: some View {
+        ScrollView(.horizontal) {
+            HStack(alignment: .top, spacing: Layout.medium) {
+                ForEach(assets) { asset in
+                    AssetCard(
+                        library: model.library,
+                        asset: asset,
+                        isKeeper: asset.id == proposal.keeper.id,
+                        willDelete: proposal.donorIDsToDelete.contains(asset.id),
+                        showsDuration: showsDuration,
+                        locationNeedsAttention: locationNeedsAttention,
+                        quickLook: { previewedAsset = asset },
+                        chooseKeeper: { model.chooseKeeper(proposalID: proposal.id, assetID: asset.id) },
+                        toggleDeletion: { model.toggleDeletion(proposalID: proposal.id, assetID: asset.id) }
+                    )
+                }
+            }
+            .padding(.vertical, Layout.tight)
+        }
+    }
+
+    private var conflictSection: some View {
+        SectionCard(
+            title: "Metadata to preserve",
+            systemImage: "slider.horizontal.3",
+            tint: RoleColor.attention,
+            caption: "Step 3"
+        ) {
+            VStack(alignment: .leading, spacing: Layout.medium) {
+                ForEach(Array(proposal.conflicts.enumerated()), id: \.element.id) { index, conflict in
+                    if index > 0 { Divider() }
+                    VStack(alignment: .leading, spacing: Layout.small) {
+                        Text(conflict.message)
+                            .font(.callout)
+                        LazyVGrid(
+                            columns: [GridItem(.adaptive(minimum: 248, maximum: 360), spacing: Layout.small)],
+                            alignment: .leading,
+                            spacing: Layout.small
+                        ) {
+                            ForEach(Array(([proposal.keeper] + proposal.selectedDonors).enumerated()), id: \.element.id) { position, asset in
+                                MetadataChoiceCard(
+                                    library: model.library,
+                                    asset: asset,
+                                    isKeeper: position == 0,
+                                    isSelected: metadataChoiceIsSelected(conflict.field, asset: asset),
+                                    roleLabel: position == 0 ? "Selected keeper" : "Copy \(position + 1) · marked for deletion",
+                                    value: conflictValue(conflict.field, asset: asset)
+                                ) {
+                                    model.resolve(conflict, proposalID: proposal.id, using: asset.id)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var summarySection: some View {
+        SectionCard(title: "Cleanup summary", systemImage: "arrow.right.circle", tint: .secondary) {
+            SpecGrid(items: summaryItems, labelWidth: 168)
+                .font(.callout)
+        }
+    }
+
+    private var summaryItems: [SpecGrid.Item] {
+        [
+            .init(label: "Keep in Photos", value: proposal.keeper.originalFilename, wraps: true),
+            .init(
+                label: "Move to Recently Deleted",
+                value: proposal.selectedDonors.isEmpty ? "Nothing selected" : proposal.selectedDonors.map(\.originalFilename).joined(separator: ", "),
+                wraps: true
+            ),
+            .init(
+                label: "Also keep",
+                value: proposal.retainedCandidates.isEmpty ? "No additional copies" : proposal.retainedCandidates.map(\.originalFilename).joined(separator: ", "),
+                wraps: true
+            ),
+            .init(label: "Capture date", value: proposal.proposedCreationDate?.formatted(date: .abbreviated, time: .standard) ?? "None"),
+            .init(label: "Location", value: proposal.proposedLocation.map { String(format: "%.5f, %.5f", $0.latitude, $0.longitude) } ?? "None"),
+            .init(label: "Caption", value: proposal.proposedCaption ?? "None", wraps: true),
+            .init(label: "Favorite", value: proposal.proposedFavorite ? "Yes" : "No"),
+            .init(label: "Keywords", value: proposal.proposedKeywords.isEmpty ? "None" : proposal.proposedKeywords.joined(separator: ", "), wraps: true),
+            .init(label: "Albums added", value: proposal.albumsToAdd.isEmpty ? "None" : proposal.albumsToAdd.map(\.title).joined(separator: ", "), wraps: true)
+        ]
+    }
+
+    // One filled button per screen; navigation and batch edits stay plain.
+    private var actionBar: some View {
+        HStack(spacing: Layout.medium) {
+            HStack(spacing: Layout.tight) {
+                Button {
+                    model.selectAdjacent(to: proposal.id, offset: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .help("Previous group")
+                Button {
+                    model.selectAdjacent(to: proposal.id, offset: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .help("Next group")
+            }
+            .buttonStyle(.borderless)
+
+            if let position = model.position(of: proposal.id) {
+                Text("\(position.index) of \(position.total)")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: Layout.medium)
+
             if proposal.isApproved {
                 Button("Remove from Batch") { model.setApproved(false, proposalID: proposal.id) }
-                Label("\(proposal.selectedDonors.count) selected for deletion", systemImage: "trash")
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(.borderless)
+                Button("Next Group") { model.selectAdjacent(to: proposal.id, offset: 1) }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
             } else {
-                if proposal.selectedDonors.isEmpty {
-                    Text("Mark at least one non-keeper copy for deletion.").foregroundStyle(.secondary)
-                } else if !proposal.conflicts.isEmpty {
-                    Text("Resolve \(proposal.conflicts.count) metadata conflict\(proposal.conflicts.count == 1 ? "" : "s") first.").foregroundStyle(.orange)
-                }
-                Button("Add \(proposal.selectedDonors.count) to Cleanup Batch & Next", systemImage: "checkmark.circle.fill") {
+                statusHint
+                Button("Add \(proposal.selectedDonors.count) to Cleanup Batch") {
                     model.approveAndAdvance(proposalID: proposal.id)
                 }
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
                 .disabled(!proposal.canApprove)
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) { Divider().opacity(0.6) }
-        .shadow(color: .black.opacity(0.08), radius: 16, y: -4)
+        .padding(.horizontal, Layout.large)
+        .padding(.vertical, Layout.medium)
+        .actionBarSurface()
+    }
+
+    @ViewBuilder private var statusHint: some View {
+        if proposal.selectedDonors.isEmpty {
+            Label("Mark at least one copy for deletion", systemImage: "circle.dashed")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else if !proposal.conflicts.isEmpty {
+            Label(
+                "Resolve \(proposal.conflicts.count) metadata \(pluralized(proposal.conflicts.count, "choice", "choices"))",
+                systemImage: "exclamationmark.circle"
+            )
+            .font(.caption)
+            .foregroundStyle(RoleColor.attention)
+        } else if reclaimedBytes > 0 {
+            Label("Frees \(formattedBytes(reclaimedBytes))", systemImage: "internaldrive")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private func conflictValue(_ field: MetadataField, asset: AssetSnapshot) -> String {
@@ -532,117 +800,66 @@ private struct ProposalDetailView: View {
             if asset.isRAW { parts.append("RAW") }
             if asset.isLivePhoto { parts.append("Live Photo") }
             parts.append(asset.contentType)
-            return parts.joined(separator: " • ")
-        }
-    }
-}
-
-private struct GlassGroupBoxStyle: GroupBoxStyle {
-    let icon: String
-    let tint: Color
-
-    func makeBody(configuration: Configuration) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 9) {
-                Image(systemName: icon)
-                    .foregroundStyle(tint)
-                    .frame(width: 24, height: 24)
-                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                configuration.label.font(.headline)
-            }
-            configuration.content
-        }
-        .padding(18)
-        .liquidGlassSurface(tint: tint.opacity(0.04))
-    }
-}
-
-private struct MetadataChoiceCard: View {
-    let library: PhotoLibraryClient
-    let asset: AssetSnapshot
-    let isKeeper: Bool
-    let roleLabel: String
-    let value: String
-    let choose: () -> Void
-    @State private var image: NSImage?
-
-    var body: some View {
-        Button(action: choose) {
-            HStack(spacing: 10) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 6).fill(.quaternary)
-                    if let image { Image(nsImage: image).resizable().scaledToFill() }
-                    else { Image(systemName: asset.mediaKind == .video ? "video" : "photo").foregroundStyle(.secondary) }
-                }
-                .frame(width: 58, height: 58)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(roleLabel)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(isKeeper ? Color.green : Color.red)
-                    Text(value)
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                    Text(asset.originalFilename)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer(minLength: 4)
-                Image(systemName: "checkmark.circle")
-                    .font(.title3)
-                    .foregroundStyle(.tint)
-            }
-            .padding(10)
-            .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
-            .liquidGlassSurface(cornerRadius: 13, tint: isKeeper ? CleanerStyle.mint.opacity(0.08) : CleanerStyle.accent.opacity(0.05))
-        }
-        .buttonStyle(.plain)
-        .help("Keep this metadata value")
-        .task {
-            image = try? await library.thumbnail(
-                assetID: asset.id,
-                targetSize: .init(width: 116, height: 116),
-                networkAccessAllowed: false
-            )
+            return parts.joined(separator: " · ")
         }
     }
 
+    private func metadataChoiceIsSelected(_ field: MetadataField, asset: AssetSnapshot) -> Bool {
+        switch field {
+        case .creationDate:
+            return asset.creationDate == proposal.proposedCreationDate
+        case .location:
+            return asset.location == proposal.proposedLocation
+        case .caption:
+            return asset.caption?.trimmingCharacters(in: .whitespacesAndNewlines)
+                == proposal.proposedCaption?.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .hidden:
+            return asset.isHidden == proposal.proposedHidden
+        case .rating:
+            return asset.rating == proposal.proposedRating
+        case .adjustments, .resourceTopology:
+            return asset.id == proposal.keeper.id
+        }
+    }
 }
 
 private struct ReviewSteps: View {
     let proposal: MergeProposal
 
     var body: some View {
-        HStack(spacing: 8) {
-            StepPill(number: 1, text: "Keeper: \(proposal.keeper.originalFilename)", complete: true)
-            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-            StepPill(number: 2, text: proposal.selectedDonors.isEmpty ? "Choose deletions" : "Delete \(proposal.selectedDonors.count)", complete: !proposal.selectedDonors.isEmpty)
-            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-            StepPill(number: 3, text: proposal.conflicts.isEmpty ? "Metadata ready" : "Resolve metadata", complete: proposal.conflicts.isEmpty)
+        HStack(spacing: Layout.small) {
+            step(number: 1, text: "Keeper chosen", complete: true)
+            separator
+            step(
+                number: 2,
+                text: proposal.selectedDonors.isEmpty ? "Choose deletions" : "\(proposal.selectedDonors.count) marked for deletion",
+                complete: !proposal.selectedDonors.isEmpty
+            )
+            separator
+            step(
+                number: 3,
+                text: proposal.conflicts.isEmpty ? "Metadata ready" : "Choose metadata",
+                complete: proposal.conflicts.isEmpty
+            )
         }
-        .font(.caption.weight(.medium))
+        .font(.caption)
         .fixedSize(horizontal: false, vertical: true)
     }
-}
 
-private struct StepPill: View {
-    let number: Int
-    let text: String
-    let complete: Bool
+    private var separator: some View {
+        Image(systemName: "chevron.compact.right")
+            .foregroundStyle(.tertiary)
+    }
 
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: complete ? "checkmark.circle.fill" : "\(number).circle.fill")
-            Text(text).lineLimit(1)
+    private func step(number: Int, text: String, complete: Bool) -> some View {
+        HStack(spacing: Layout.tight) {
+            Image(systemName: complete ? "checkmark.circle.fill" : "\(number).circle")
+                .imageScale(.small)
+            Text(text)
+                .lineLimit(1)
         }
-        .foregroundStyle(complete ? Color.green : Color.gray)
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .background((complete ? CleanerStyle.mint : Color.gray).opacity(0.11), in: Capsule())
+        .foregroundStyle(.secondary)
+        .fontWeight(complete ? .regular : .medium)
     }
 }
 
@@ -651,114 +868,65 @@ private struct AssetCard: View {
     let asset: AssetSnapshot
     let isKeeper: Bool
     let willDelete: Bool
+    let showsDuration: Bool
     let locationNeedsAttention: Bool
     let quickLook: () -> Void
     let chooseKeeper: () -> Void
     let toggleDeletion: () -> Void
+
     @State private var image: NSImage?
     @State private var thumbnailUnavailable = false
+    @State private var isHovering = false
     @FocusState private var isFocused: Bool
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 15, style: .continuous).fill(.quaternary)
-                if let image {
-                    Image(nsImage: image).resizable().scaledToFit()
-                } else if thumbnailUnavailable {
-                    VStack(spacing: 7) {
-                        Image(systemName: "icloud.and.arrow.down")
-                            .font(.title2)
-                        Text("Open preview to load")
-                            .font(.caption)
-                    }
-                    .foregroundStyle(.secondary)
-                } else {
-                    ProgressView()
-                }
-                VStack {
-                    HStack {
-                        Spacer()
-                        Text(isKeeper ? "KEEPER" : (willDelete ? "DELETE" : "KEEP"))
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 9).padding(.vertical, 5)
-                            .background(isKeeper ? CleanerStyle.mint : (willDelete ? Color.red : Color.secondary), in: Capsule())
-                            .foregroundStyle(.white)
-                    }
-                    Spacer()
-                }.padding(8)
-                VStack {
-                    Spacer()
-                    HStack {
-                        Button(action: quickLook) {
-                            Label(asset.mediaKind == .video ? "Play Video" : "Quick Look", systemImage: asset.mediaKind == .video ? "play.fill" : "eye.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.black.opacity(0.68))
-                        .controlSize(.small)
-                        Spacer()
-                    }
-                }
-                .padding(9)
+    private var accent: Color? {
+        if isKeeper { return RoleColor.keeper }
+        if willDelete { return RoleColor.removal }
+        return nil
+    }
+
+    private var disposition: Binding<CopyDisposition> {
+        Binding(
+            get: { willDelete ? .delete : .keep },
+            set: { newValue in
+                if (newValue == .delete) != willDelete { toggleDeletion() }
             }
-            .frame(width: 292, height: 226)
-            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-            .contentShape(Rectangle())
-            .onTapGesture {
-                isFocused = true
-                quickLook()
-            }
-            if isKeeper {
-                Label("Selected keeper", systemImage: "checkmark.circle.fill")
-                    .font(.headline).foregroundStyle(CleanerStyle.mint)
-            } else {
-                HStack {
-                    Button("Make Keeper", action: chooseKeeper).buttonStyle(.bordered)
-                    if willDelete {
-                        Button("Undo Delete", action: toggleDeletion).buttonStyle(.bordered)
-                    } else {
-                        Button("Delete This Copy", role: .destructive, action: toggleDeletion)
-                            .buttonStyle(.borderedProminent).tint(.red)
-                    }
-                }
-            }
-            Text(asset.originalFilename).font(.headline).lineLimit(1).truncationMode(.middle)
-            Text("\(asset.pixelWidth) × \(asset.pixelHeight) • \(ByteCountFormatter.string(fromByteCount: asset.totalKnownBytes, countStyle: .file))")
-                .font(.caption).foregroundStyle(.secondary)
-            if asset.mediaKind == .video {
-                Label(formattedDuration(asset.duration), systemImage: "timer")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(CleanerStyle.accent)
-            }
-            Text(asset.creationDate?.formatted(date: .abbreviated, time: .standard) ?? "No capture date").font(.caption)
-            locationLabel
-            HStack {
-                if asset.isLivePhoto { Label("Live", systemImage: "livephoto") }
-                if asset.isRAW { Text("RAW") }
-                if asset.hasAdjustments { Label("Edited", systemImage: "slider.horizontal.3") }
-            }.font(.caption2).foregroundStyle(.secondary)
-        }
-        .padding(12)
-        .liquidGlassSurface(
-            cornerRadius: 20,
-            tint: isKeeper ? CleanerStyle.mint.opacity(0.12) : (willDelete ? Color.red.opacity(0.08) : CleanerStyle.accent.opacity(0.04))
         )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Layout.medium) {
+            media
+            VStack(alignment: .leading, spacing: Layout.small) {
+                badge
+                Text(asset.originalFilename)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(asset.originalFilename)
+                SpecGrid(items: specs, labelWidth: 68)
+                    .font(.caption)
+                attributes
+            }
+            Divider()
+            actions
+        }
+        .padding(Layout.medium)
+        .frame(width: Layout.cardWidth, alignment: .leading)
+        .cardSurface(accent: accent)
         .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(isKeeper ? CleanerStyle.mint : (willDelete ? Color.red : Color.clear), lineWidth: 1.5)
+            // Keyboard focus ring sits outside the card so the role accent stays readable.
+            if isFocused {
+                RoundedRectangle(cornerRadius: Layout.cardRadius + 2, style: .continuous)
+                    .strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 2)
+                    .padding(-3)
+            }
         }
-        .focusable()
-        .focused($isFocused)
-        .onKeyPress(.space) {
-            quickLook()
-            return .handled
-        }
-        .help("Click the media or focus this card and press Space to preview it")
         .task {
             do {
                 image = try await library.thumbnail(
                     assetID: asset.id,
-                    targetSize: .init(width: 520, height: 400),
+                    targetSize: .init(width: 640, height: 480),
                     networkAccessAllowed: false
                 )
             } catch {
@@ -767,20 +935,205 @@ private struct AssetCard: View {
         }
     }
 
-    @ViewBuilder private var locationLabel: some View {
-        if let location = asset.location {
-            Label(String(format: "%.4f, %.4f", location.latitude, location.longitude), systemImage: "location.fill")
-                .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
-                .font(.caption)
-                .fontWeight(locationNeedsAttention ? .semibold : .regular)
+    private var media: some View {
+        Button(action: quickLook) {
+            ZStack {
+                RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous)
+                    .fill(Surface.inner)
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .padding(2)
+                } else if thumbnailUnavailable {
+                    VStack(spacing: Layout.small) {
+                        Image(systemName: "icloud.and.arrow.down")
+                            .font(.title3)
+                        Text("Open preview to load")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                if asset.mediaKind == .video || isHovering {
+                    Image(systemName: asset.mediaKind == .video ? "play.circle.fill" : "eye.circle.fill")
+                        .font(.system(size: 30))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.4))
+                        .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
+                }
+            }
+            .frame(height: Layout.mediaHeight)
+            .frame(maxWidth: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous)
+                    .strokeBorder(Surface.hairline, lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .focusable()
+        .focused($isFocused)
+        .onHover { isHovering = $0 }
+        .onKeyPress(.space) {
+            quickLook()
+            return .handled
+        }
+        .help(asset.mediaKind == .video ? "Play this video · Space" : "Open a large preview · Space")
+    }
+
+    @ViewBuilder private var badge: some View {
+        if isKeeper {
+            RoleBadge(text: "Keeper", systemImage: "checkmark.circle.fill", color: RoleColor.keeper)
+        } else if willDelete {
+            RoleBadge(text: "Delete", systemImage: "trash", color: RoleColor.removal)
         } else {
-            Label(locationNeedsAttention ? "Location missing — compare carefully" : "No location", systemImage: "location.slash")
-                .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
+            RoleBadge(text: "Keep", systemImage: "photo.on.rectangle", color: .secondary)
+        }
+    }
+
+    private var specs: [SpecGrid.Item] {
+        var items: [SpecGrid.Item] = [
+            .init(label: "Resolution", value: "\(asset.pixelWidth) × \(asset.pixelHeight)"),
+            .init(label: "Size", value: formattedBytes(asset.totalKnownBytes))
+        ]
+        if showsDuration {
+            items.append(.init(
+                label: "Duration",
+                value: asset.mediaKind == .video ? formattedDuration(asset.duration) : "—"
+            ))
+        }
+        items.append(.init(label: "Date", value: asset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "None"))
+        if let location = asset.location {
+            items.append(.init(
+                label: "Location",
+                value: String(format: "%.4f, %.4f", location.latitude, location.longitude),
+                systemImage: "location.fill",
+                tint: locationNeedsAttention ? RoleColor.attention : nil
+            ))
+        } else {
+            items.append(.init(
+                label: "Location",
+                value: locationNeedsAttention ? "Missing — compare" : "None",
+                systemImage: "location.slash",
+                tint: locationNeedsAttention ? RoleColor.attention : nil
+            ))
+        }
+        return items
+    }
+
+    private var attributes: some View {
+        HStack(spacing: Layout.small) {
+            if asset.isLivePhoto { Label("Live", systemImage: "livephoto") }
+            if asset.isRAW { Label("RAW", systemImage: "camera.aperture") }
+            if asset.hasAdjustments { Label("Edited", systemImage: "slider.horizontal.3") }
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .frame(height: Layout.attributeRowHeight, alignment: .leading)
+    }
+
+    @ViewBuilder private var actions: some View {
+        if isKeeper {
+            Text("Stays in Photos")
                 .font(.caption)
-                .fontWeight(locationNeedsAttention ? .semibold : .regular)
+                .foregroundStyle(.secondary)
+                .frame(height: Layout.actionRowHeight)
+        } else {
+            HStack(spacing: Layout.small) {
+                Picker("Disposition", selection: disposition) {
+                    Text("Keep").tag(CopyDisposition.keep)
+                    Text("Delete").tag(CopyDisposition.delete)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
+                Spacer(minLength: Layout.tight)
+                Button("Make Keeper", action: chooseKeeper)
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+            }
+            .frame(height: Layout.actionRowHeight)
         }
     }
 }
+
+private struct MetadataChoiceCard: View {
+    let library: PhotoLibraryClient
+    let asset: AssetSnapshot
+    let isKeeper: Bool
+    let isSelected: Bool
+    let roleLabel: String
+    let value: String
+    let choose: () -> Void
+
+    @State private var image: NSImage?
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: choose) {
+            HStack(spacing: Layout.snug) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous)
+                        .fill(Surface.inner)
+                    if let image {
+                        Image(nsImage: image).resizable().scaledToFill()
+                    } else {
+                        Image(systemName: asset.mediaKind == .video ? "video" : "photo")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: 52, height: 52)
+                .clipShape(RoundedRectangle(cornerRadius: Layout.controlRadius, style: .continuous))
+
+                VStack(alignment: .leading, spacing: Layout.tight) {
+                    HStack(spacing: Layout.tight) {
+                        Circle()
+                            .fill(isKeeper ? RoleColor.keeper : RoleColor.removal)
+                            .frame(width: 5, height: 5)
+                        Text(roleLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text(value)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer(minLength: Layout.tight)
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .imageScale(.large)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary.opacity(0.4))
+            }
+            .padding(Layout.snug)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isHovering ? Color.accentColor.opacity(0.08) : Surface.inner,
+                in: RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous)
+                    .strokeBorder(isHovering ? Color.accentColor.opacity(0.6) : Surface.hairline, lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help("Keep this value on the keeper")
+        .task {
+            image = try? await library.thumbnail(
+                assetID: asset.id,
+                targetSize: .init(width: 104, height: 104),
+                networkAccessAllowed: false
+            )
+        }
+    }
+}
+
+// MARK: - Preview sheet
 
 private struct MediaQuickLookView: View {
     let library: PhotoLibraryClient
@@ -795,10 +1148,10 @@ private struct MediaQuickLookView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
+            HStack(spacing: Layout.snug) {
                 Image(systemName: asset.mediaKind == .video ? "video.fill" : "photo.fill")
-                    .foregroundStyle(CleanerStyle.accent)
-                VStack(alignment: .leading, spacing: 2) {
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: Layout.micro) {
                     Text(asset.originalFilename)
                         .font(.headline)
                         .lineLimit(1)
@@ -807,26 +1160,25 @@ private struct MediaQuickLookView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
+                Spacer(minLength: Layout.medium)
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(16)
+            .padding(Layout.medium)
 
             Divider()
 
             ZStack {
-                Color.black.opacity(0.94)
+                Color.black
                 if needsPhotoAccess {
                     ContentUnavailableView {
                         Label("Photos Access Needed", systemImage: "photo.badge.exclamationmark")
                     } description: {
                         Text("PhotoKit needs full Photos access to open this selected library item.")
                     } actions: {
-                        HStack {
+                        HStack(spacing: Layout.small) {
                             Button("Open Privacy Settings") { openPhotosPrivacySettings() }
                             Button("Try Again") { Task { await loadPreview() } }
-                                .buttonStyle(.borderedProminent)
                         }
                     }
                     .foregroundStyle(.white)
@@ -839,18 +1191,19 @@ private struct MediaQuickLookView: View {
                     .foregroundStyle(.white)
                 } else if asset.mediaKind == .video, let player {
                     NativeVideoPlayer(player: player)
-                        .padding(18)
+                        .padding(Layout.medium)
                 } else if let image {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
-                        .padding(18)
+                        .padding(Layout.medium)
                 } else if isLoading {
-                    VStack(spacing: 12) {
+                    VStack(spacing: Layout.small) {
                         ProgressView()
                             .controlSize(.large)
                         Text(asset.mediaKind == .video ? "Loading video…" : "Loading photo…")
-                            .foregroundStyle(.white.opacity(0.72))
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
                     }
                 }
             }
@@ -869,7 +1222,7 @@ private struct MediaQuickLookView: View {
         if asset.mediaKind == .video { details.append(formattedDuration(asset.duration)) }
         if asset.isLivePhoto { details.append("Live Photo") }
         if asset.isRAW { details.append("RAW") }
-        return details.joined(separator: " • ")
+        return details.joined(separator: " · ")
     }
 
     @MainActor
@@ -938,99 +1291,85 @@ private struct NativeVideoPlayer: NSViewRepresentable {
     }
 }
 
-private struct MetadataGridRow: View {
-    let label: String
-    let value: String
-    var body: some View {
-        GridRow {
-            Text(label).font(.callout.weight(.medium)).foregroundStyle(.secondary)
-            Text(value).textSelection(.enabled)
-        }
-    }
-}
+// MARK: - Cleanup confirmation
 
 private struct BatchAssetPreview: View {
     let library: PhotoLibraryClient
     let asset: AssetSnapshot
     let isKeeper: Bool
     let locationNeedsAttention: Bool
+
     @State private var image: NSImage?
 
-    private var roleColor: Color { isKeeper ? CleanerStyle.mint : .red }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Layout.small) {
             ZStack {
-                RoundedRectangle(cornerRadius: 13, style: .continuous).fill(.quaternary)
+                RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous)
+                    .fill(Surface.inner)
                 if let image {
                     Image(nsImage: image).resizable().scaledToFill()
                 } else {
-                    ProgressView()
+                    ProgressView().controlSize(.small)
                 }
                 if asset.mediaKind == .video {
                     Image(systemName: "play.circle.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(.white, .black.opacity(0.35))
-                        .shadow(radius: 3)
-                }
-                VStack {
-                    HStack {
-                        Text(isKeeper ? "KEEP" : "MOVE TO RECENTLY DELETED")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 8).padding(.vertical, 5)
-                            .background(roleColor, in: Capsule())
-                            .foregroundStyle(.white)
-                        Spacer()
-                    }
-                    Spacer()
-                }
-                .padding(8)
-            }
-            .frame(width: 220, height: 128)
-            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-
-            Text(asset.originalFilename)
-                .font(.callout.weight(.semibold))
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            HStack(spacing: 8) {
-                Label("\(asset.pixelWidth) × \(asset.pixelHeight)", systemImage: "aspectratio")
-                if asset.mediaKind == .video {
-                    Label(formattedDuration(asset.duration), systemImage: "timer")
+                        .font(.system(size: 26))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.4))
                 }
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .frame(width: 200, height: Layout.batchMediaHeight)
+            .clipShape(RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Layout.innerRadius, style: .continuous)
+                    .strokeBorder(Surface.hairline, lineWidth: 1)
+            }
 
-            Label(asset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "No capture date", systemImage: "calendar")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            RoleBadge(
+                text: isKeeper ? "Keeper" : "Delete",
+                systemImage: isKeeper ? "checkmark.circle.fill" : "trash",
+                color: isKeeper ? RoleColor.keeper : RoleColor.removal
+            )
 
-            if let location = asset.location {
-                Label(String(format: "%.4f, %.4f", location.latitude, location.longitude), systemImage: "location.fill")
-                    .font(.caption.weight(locationNeedsAttention ? .semibold : .regular))
-                    .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
-            } else {
-                Label(locationNeedsAttention ? "Location missing" : "No location", systemImage: "location.slash")
-                    .font(.caption.weight(locationNeedsAttention ? .semibold : .regular))
-                    .foregroundStyle(locationNeedsAttention ? Color.orange : Color.secondary)
+            VStack(alignment: .leading, spacing: Layout.micro) {
+                Text(asset.originalFilename)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(asset.originalFilename)
+                Text(specLine)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Text(asset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "No capture date")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if locationNeedsAttention {
+                    Label(
+                        asset.location == nil ? "No location" : "Has location",
+                        systemImage: asset.location == nil ? "location.slash" : "location.fill"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(RoleColor.attention)
+                }
             }
         }
-        .frame(width: 220, alignment: .leading)
-        .padding(12)
-        .background(roleColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 17, style: .continuous)
-                .stroke(roleColor.opacity(0.5), lineWidth: 1)
-        }
+        .frame(width: 200, alignment: .leading)
+        .padding(Layout.snug)
+        .background(Surface.inner, in: RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous))
         .task {
             image = try? await library.thumbnail(
                 assetID: asset.id,
-                targetSize: .init(width: 440, height: 256),
+                targetSize: .init(width: 400, height: 240),
                 networkAccessAllowed: false
             )
         }
+    }
+
+    private var specLine: String {
+        var parts = ["\(asset.pixelWidth) × \(asset.pixelHeight)", formattedBytes(asset.totalKnownBytes)]
+        if asset.mediaKind == .video { parts.append(formattedDuration(asset.duration)) }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -1039,65 +1378,65 @@ private struct BatchProposalCard: View {
     let proposal: MergeProposal
 
     private var displayedAssets: [AssetSnapshot] { [proposal.keeper] + proposal.selectedDonors }
-    private var locationNeedsAttention: Bool {
-        Set(displayedAssets.map { $0.location != nil }).count > 1
-    }
+    private var locationNeedsAttention: Bool { Set(displayedAssets.map { $0.location != nil }).count > 1 }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label(proposal.confidence.label, systemImage: proposal.keeper.mediaKind == .video ? "video.fill" : "photo.fill")
-                    .font(.headline)
-                Spacer()
-                Text("1 kept • \(proposal.selectedDonors.count) deleted")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
+        SectionCard(
+            title: proposal.keeper.compactLabel,
+            systemImage: proposal.keeper.mediaKind == .video ? "video" : "photo",
+            caption: "1 kept · \(proposal.selectedDonors.count) deleted"
+        ) {
+            VStack(alignment: .leading, spacing: Layout.medium) {
+                HStack(alignment: .top, spacing: Layout.medium) {
+                    BatchAssetPreview(
+                        library: library,
+                        asset: proposal.keeper,
+                        isKeeper: true,
+                        locationNeedsAttention: locationNeedsAttention
+                    )
 
-            HStack(alignment: .center, spacing: 14) {
-                BatchAssetPreview(
-                    library: library,
-                    asset: proposal.keeper,
-                    isKeeper: true,
-                    locationNeedsAttention: locationNeedsAttention
-                )
+                    Image(systemName: "arrow.right")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(height: Layout.batchMediaHeight)
 
-                Image(systemName: "arrow.right")
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                ScrollView(.horizontal) {
-                    HStack(alignment: .top, spacing: 12) {
-                        ForEach(proposal.selectedDonors) { asset in
-                            BatchAssetPreview(
-                                library: library,
-                                asset: asset,
-                                isKeeper: false,
-                                locationNeedsAttention: locationNeedsAttention
-                            )
+                    ScrollView(.horizontal) {
+                        HStack(alignment: .top, spacing: Layout.small) {
+                            ForEach(proposal.selectedDonors) { asset in
+                                BatchAssetPreview(
+                                    library: library,
+                                    asset: asset,
+                                    isKeeper: false,
+                                    locationNeedsAttention: locationNeedsAttention
+                                )
+                            }
                         }
+                        .padding(.bottom, Layout.tight)
                     }
                 }
-                .scrollIndicators(.visible)
-            }
 
-            if locationNeedsAttention {
-                Label("Final keeper location: \(finalLocationText)", systemImage: "location.fill.viewfinder")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.orange)
-            }
-            if !proposal.retainedCandidates.isEmpty {
-                Label("\(proposal.retainedCandidates.count) additional cop\(proposal.retainedCandidates.count == 1 ? "y is" : "ies are") staying in Photos.", systemImage: "photo.on.rectangle")
+                if locationNeedsAttention || !proposal.retainedCandidates.isEmpty {
+                    VStack(alignment: .leading, spacing: Layout.tight) {
+                        if locationNeedsAttention {
+                            Label("Keeper location will be \(finalLocationText)", systemImage: "location")
+                                .foregroundStyle(RoleColor.attention)
+                        }
+                        if !proposal.retainedCandidates.isEmpty {
+                            Label(
+                                "\(proposal.retainedCandidates.count) additional \(pluralized(proposal.retainedCandidates.count, "copy stays", "copies stay")) in Photos",
+                                systemImage: "photo.on.rectangle"
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                    }
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                }
             }
         }
-        .padding(16)
-        .liquidGlassSurface(cornerRadius: 20)
     }
 
     private var finalLocationText: String {
-        guard let location = proposal.proposedLocation else { return "No location" }
+        guard let location = proposal.proposedLocation else { return "empty" }
         return String(format: "%.4f, %.4f", location.latitude, location.longitude)
     }
 }
@@ -1107,51 +1446,74 @@ private struct BatchConfirmationView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var deletionCount: Int { model.approvedProposals.flatMap(\.selectedDonors).count }
+    private var reclaimedBytes: Int64 {
+        model.approvedProposals.flatMap(\.selectedDonors).reduce(0) { $0 + $1.totalKnownBytes }
+    }
 
     var body: some View {
-        ZStack {
-            AmbientBackdrop()
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 14) {
-                    Image(systemName: "photo.badge.checkmark")
-                        .font(.system(size: 30, weight: .semibold))
-                        .foregroundStyle(CleanerStyle.accent)
-                        .frame(width: 56, height: 56)
-                        .background(CleanerStyle.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Confirm photo & video cleanup").font(.title.bold())
-                        Text("See exactly what stays and what moves to Recently Deleted.").foregroundStyle(.secondary)
-                    }
-                }
-
-                HStack(spacing: 16) {
-                    Label("\(model.approvedProposals.count) groups", systemImage: "square.stack.3d.up")
-                    Label("\(deletionCount) duplicates", systemImage: "trash")
-                }
-                .font(.headline)
-
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(model.approvedProposals) { proposal in
-                            BatchProposalCard(library: model.library, proposal: proposal)
-                        }
-                    }
-                    .padding(2)
-                }
-
-                Label("Photos keeps deleted items temporarily. The journal can restore metadata, but not media after permanent deletion.", systemImage: "clock.arrow.circlepath")
-                    .foregroundStyle(.orange)
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: Layout.small) {
+                Text("Confirm cleanup")
+                    .font(.title3.weight(.semibold))
+                Text("Review exactly what stays in Photos and what moves to Recently Deleted.")
                     .font(.callout)
-                HStack {
-                    Spacer()
-                    Button("Cancel") { dismiss() }
-                    Button("Move \(deletionCount) Duplicates to Recently Deleted", role: .destructive) { model.applyApproved() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: Layout.small) {
+                    CountChip(
+                        value: model.approvedProposals.count,
+                        label: pluralized(model.approvedProposals.count, "group", "groups"),
+                        color: .accentColor
+                    )
+                    CountChip(value: deletionCount, label: "to delete", color: RoleColor.removal)
                 }
+                .padding(.top, Layout.tight)
             }
-            .padding(26)
+            .padding(Layout.large)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: Layout.medium) {
+                    ForEach(model.approvedProposals) { proposal in
+                        BatchProposalCard(library: model.library, proposal: proposal)
+                    }
+                }
+                .padding(Layout.large)
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+
+            Divider()
+
+            HStack(spacing: Layout.medium) {
+                Label(
+                    "Photos keeps deleted items temporarily. The journal restores metadata, not media that Photos has removed for good.",
+                    systemImage: "clock.arrow.circlepath"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: Layout.small)
+
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.borderless)
+                Button(deleteButtonTitle, role: .destructive) { model.applyApproved() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(RoleColor.removal)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, Layout.large)
+            .padding(.vertical, Layout.medium)
         }
-        .frame(width: 960, height: 720)
+        .frame(width: 920, height: 680)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var deleteButtonTitle: String {
+        let noun = pluralized(deletionCount, "Copy", "Copies")
+        return reclaimedBytes > 0
+            ? "Delete \(deletionCount) \(noun) · \(formattedBytes(reclaimedBytes))"
+            : "Delete \(deletionCount) \(noun)"
     }
 }

@@ -24,7 +24,7 @@ The app runs locally. It has no analytics, advertising, account system, or devel
 - Scanning and fingerprinting are read-only.
 - All library access uses Apple's PhotoKit framework; the app never opens or edits the private `.photoslibrary` database.
 - Exact and likely-visual matches are displayed separately. Likely matches always require review.
-- Choosing a keeper initially marks every other copy for deletion; use **Undo Delete** on any copy you want to retain.
+- Choosing a keeper initially marks every other copy for deletion; switch any copy you want to retain back to **Keep**.
 - Likely-matching videos must have compatible durations and aspect ratios as well as matching sampled frames. The full duration span is checked again before a video group is shown.
 - If location exists on only some copies, cleanup pauses for an explicit choice so missing GPS metadata is not silently overlooked.
 - A journal records metadata and identifiers, not copies of the media files.
@@ -69,7 +69,7 @@ If Swift reports that the SDK is not supported by the compiler, update or reinst
 2. Scan the personal library or select writable albums.
 3. Wait while thumbnails are fingerprinted and only candidate originals are hashed.
 4. Click a photo or video preview, or focus its card and press Space, to inspect it at a large size. Choose the keeper and explicitly review every deletion choice.
-5. Resolve highlighted metadata conflicts, choose **Add to Cleanup Batch & Next**, and inspect the thumbnail-based keep/delete comparison.
+5. Resolve the metadata choices in **Metadata to preserve**, choose **Add to Cleanup Batch**, and inspect the thumbnail-based keep/delete comparison.
 6. Confirm cleanup, verify the keepers and Recently Deleted in Photos, and export the JSON/CSV journal if desired.
 
 If Photos changes after a scan, whether while the app is open or between launches, the app preserves the existing review, marks it stale, and offers a fresh scan. Choosing **Later** avoids repeated prompts for that stale scan, but cleanup remains disabled until verification succeeds.
